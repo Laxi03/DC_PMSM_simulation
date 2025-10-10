@@ -146,12 +146,12 @@ def huber(x: float, k: float = 0.05) -> float:
     ax = abs(x)
     return (0.5 * (ax**2) / k) if ax <= k else (ax - 0.5 * k)
 
-class MotorEnv(gym.Env):  # type: ignore[misc]
+class MotorEnv(gym.Env):
     metadata = {"render_modes": []}
     def __init__(self,
                  task="speed",
                  dt=1e-4,
-                 frame_skip=20,            # faster control by default (≈500 Hz)
+                 frame_skip=20,            # faster control
                  Vdc=24.0,
                  ulim=1.0,
                  ref_kind_speed="rand_steps",
@@ -345,18 +345,18 @@ class MotorEnv(gym.Env):  # type: ignore[misc]
 
             # authority-aware penalties (phase dependent)
             m = self._authority_multiplier()
-
-            r = - ( self.rw_e * huber(e_norm, k=0.05)
-                    + m * self.rw_u  * (u_norm**2)
-                    + m * self.rw_du * abs(du_norm)
-                    + self.rw_de * abs(de_norm)
-                    + self.rw_i  * (i_norm**2) )
+            #REWARD FUNCTION
+            r = - ( self.rw_e * huber(e_norm, k=0.05) #Tracking error
+                    + m * self.rw_u  * (u_norm**2) #Control effor penalty
+                    + m * self.rw_du * abs(du_norm) #Actuation rate
+                    + self.rw_de * abs(de_norm) #Error derivative
+                    + self.rw_i  * (i_norm**2) ) #Current magnitude
 
             # soft-safety nudges near state clamps
             if abs(self.state.i) > 0.9 * self.i_abs_max:          r -= 0.05
             if abs(self.state.omega) > 0.9 * self.omega_abs_max:   r -= 0.05
 
-            r = float(np.clip(r, -2.0, 0.3))
+            r = float(np.clip(r, -2.0, 0.3)) #Terminal bonus
             rew_sum += r
 
             self.prev_e_norm = e_norm
