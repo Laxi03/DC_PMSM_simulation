@@ -145,7 +145,7 @@ After each run, results appear in `exports/<timestamp>/`:
 
 ## 📄 License
 
-MIT License (or adapt to your project’s terms)
+MIT License
 
 ---
 
