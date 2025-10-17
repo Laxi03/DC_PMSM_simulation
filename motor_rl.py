@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-motor_rl.py — DC motor RL-only (TD3, Gymnasium + Stable-Baselines3)
+motor_rl.py — DC motor RL - controll (TD3, Gymnasium + Stable-Baselines3)
 
-Robust setup (no extra u cap):
+Robust setup:
 - Soft-safety on states (clip + gentle penalties), no early termination
-- Env never returns NaN/Inf (sanitized obs/reward, mid-step guard)
 - Randomized step references (incl. negatives) + domain randomization
 - Huber tracking + (phase-aware) authority penalties + terminal bonus
 - Actuator low-pass (prevents chatter)
 - TD3 with action noise and conservative hyperparams (+ resume training)
-- Live evaluation: slowed playback, autoscaling axes, clear labels
 """
 
 from typing import Tuple, Optional
@@ -94,10 +92,9 @@ class AMax32Motor:
 # References
 # =========================
 def generate_random_steps(duration: float,
-                          min_val=-600.0, max_val=600.0,
-                          min_seg=0.3, max_seg=1.2,
+                          min_val=-676.46, max_val=676.46,
+                          min_seg=0.8, max_seg=1.5,
                           skew_high_prob=0.5, high_lo=300.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Random step sequence, optionally skewed to spend more time at high ω."""
     t_points = [0.0]
     while t_points[-1] < duration:
         t_points.append(min(duration, t_points[-1] + float(np.random.uniform(min_seg, max_seg))))
@@ -122,10 +119,11 @@ def speed_ref_profile(t: float, kind: str, w_ref: float, rand_seq=None) -> float
     if kind == "const":
         return float(w_ref)
     if kind == "step_seq_motor":
-        if t < 1.0: return 200.0
+        if t < 0.5: return 0.0
+        if t < 1.0: return 100.0
         if t < 2.0: return 325.0
         if t < 3.0: return 50.0
-        if t < 4.0: return 150.0
+        if t < 4.0: return -150.0
         return 523.60
     if kind == "rand_steps" and rand_seq is not None:
         t_points, w_values = rand_seq
@@ -165,8 +163,8 @@ class MotorEnv(gym.Env):
                  i_abs_max=6.0,
                  omega_abs_max=900.0,
                  # noise
-                 obs_noise=0.002,
-                 load_noise=0.06,
+                 obs_noise=0.000,
+                 load_noise=0.00,
                  # training disturbances
                  load_step_prob=0.4,
                  base_load=0.02,
@@ -213,7 +211,7 @@ class MotorEnv(gym.Env):
 
         self.rand_seq: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        # obs = [omega_n, i_n, u_n, e_norm, headroom, sin(t)]
+        # obs = [omega_n, i_n, u_n, e_norm, headroom, sin(t)] #sin táplálás nem szükséges
         obs_high = np.ones(6, np.float32)
         self.observation_space = spaces.Box(-obs_high, high=obs_high, dtype=np.float32)
 
@@ -454,20 +452,21 @@ def train_rl(args):
             verbose=2,
             device="auto",
             seed=args.seed,
-            learning_rate=3e-4,
+            learning_rate=1e-3, #kicsit nagyobb learning rate
             buffer_size=300_000,
             batch_size=128,
-            learning_starts=5000,
+            learning_starts=10_000, #kicsit nagyobb 10k ra
             train_freq=(1, "step"),
             gradient_steps=1,
             gamma=0.99,
             tau=0.005,
-            policy_kwargs=dict(net_arch=[128, 128]),
+            policy_kwargs=dict(net_arch=[128, 64]), #128, 64 vagy 256 128
             action_noise=action_noise,
             policy_delay=2,
-            target_policy_noise=0.2,
-            target_noise_clip=0.5,
+            target_policy_noise=0.0,
+            target_noise_clip=0.0,
         )
+        #exploration fraction (0.1)
 
     eval_cb = EvalCallback(
         eval_env,
@@ -489,78 +488,108 @@ def train_rl(args):
     print(f"[RL] Saved model → {path}")
 
 def eval_rl(args):
-    """Live streaming plot with autoscale (& slowed playback) or static plots."""
+    """Live plotting evaluation for a trained TD3 model (or static if --live not set)."""
     try:
         from stable_baselines3 import TD3
     except Exception:
-        print("Stable-Baselines3 not available. Install: pip install stable-baselines3 torch gymnasium")
+        print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
         return
 
     if not args.model_path:
         print("--model_path missing.")
         return
     mpath = os.path.expanduser(args.model_path)
-    if not mpath.endswith(".zip"): mpath += ".zip"
+    if not mpath.endswith(".zip"):
+        mpath += ".zip"
     if not os.path.exists(mpath):
         raise FileNotFoundError(f"Model file not found: {mpath}")
 
     env = make_env(args)
     model = TD3.load(mpath, device="auto")
 
-    obs, _ = env.reset(seed=args.seed)
+    # ---- evaluation horizon in RL steps ----
     steps = int(args.t_end / (args.dt * args.frame_skip))
+    obs, _ = env.reset(seed=args.seed)
 
+    # ---- buffers ----
     ts, us, is_, ws, wrefs, Tems, Tls = [], [], [], [], [], [], []
 
-    if args.live:
+    # ---- live figure (optional) ----
+    live_mode = bool(args.live)
+    if live_mode:
         import matplotlib.pyplot as plt
         plt.ion()
         fig, axs = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
-        (l_u,)   = axs[0].plot([], [], lw=1.2, label="u")
-        axs[0].set_ylabel("u [V]"); axs[0].legend(); axs[0].grid(True)
-        (l_i,)   = axs[1].plot([], [], lw=1.2, label="i")
-        (l_iref,) = axs[1].plot([], [], "--", lw=1.0, label="i_ref (n/a)")
-        axs[1].set_ylabel("i [A]"); axs[1].legend(); axs[1].grid(True)
-        (l_w,)   = axs[2].plot([], [], lw=1.2, label="ω")
-        (l_wref,) = axs[2].plot([], [], "--", lw=1.0, label="ω_ref")
-        axs[2].set_ylabel("ω [rad/s]"); axs[2].legend(); axs[2].grid(True)
-        (l_tem,) = axs[3].plot([], [], lw=1.2, label="T_em")
-        (l_tl,)  = axs[3].plot([], [], "--", lw=1.0, label="T_load")
-        axs[3].set_ylabel("Torque [Nm]"); axs[3].legend(); axs[3].grid(True)
-        axs[3].set_xlabel("t [s]")
-        fig.suptitle(f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}")
-        wall_dt = (env.frame_skip * env.dt) / max(args.vis_speed, 1e-6)
+        for ax in axs:
+            ax.grid(True)
 
+        # lines
+        (l_u,)    = axs[0].plot([], [], lw=1.3, label="u")
+        axs[0].set_ylabel("u [V]"); axs[0].legend()
+
+        (l_i,)    = axs[1].plot([], [], lw=1.3, label="i")
+        (l_iref,) = axs[1].plot([], [], "--", lw=1.0, label="i_ref (n/a)")
+        axs[1].set_ylabel("i [A]"); axs[1].legend()
+
+        (l_w,)    = axs[2].plot([], [], lw=1.3, label="ω")
+        (l_wref,) = axs[2].plot([], [], "--", lw=1.0, label="ω_ref")
+        axs[2].set_ylabel("ω [rad/s]"); axs[2].legend()
+
+        (l_tem,)  = axs[3].plot([], [], lw=1.3, label="T_em")
+        (l_tl,)   = axs[3].plot([], [], "--", lw=1.0, label="T_load")
+        axs[3].set_ylabel("Torque [Nm]"); axs[3].legend()
+        axs[3].set_xlabel("t [s]")
+
+        fig.suptitle(f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}")
+
+        # slow down to near real-time (vis_speed=1 → real-time; 0.5 → 2× slower, 2.0 → 2× faster)
+        wall_dt = (env.unwrapped.frame_skip * env.unwrapped.dt) / max(args.vis_speed, 1e-6)
+
+    # ---- rollout ----
     for _ in range(steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, _ = env.step(action)
 
-        ts.append(env.t); us.append(env.prev_u); is_.append(env.state.i); ws.append(env.state.omega)
-        wrefs.append(speed_ref_profile(env.t, args.ref_profile, args.w_ref, env.rand_seq))
-        Tems.append(env.p.kT * env.state.i); Tls.append(env.base_load)
+        # pull signals from unwrapped env (Monitor/TimeLimit safe)
+        ue = env.unwrapped
+        ts.append(ue.t)
+        us.append(ue.prev_u)
+        is_.append(ue.state.i)
+        ws.append(ue.state.omega)
+        wrefs.append(speed_ref_profile(ue.t, ue.ref_kind_speed, ue.w_ref_base, ue.rand_seq))
+        Tems.append(ue.p.kT * ue.state.i)
+        Tls.append(ue.base_load)
 
-        if args.live:
-            import matplotlib.pyplot as plt
+        if live_mode:
+            # update lines
             l_u.set_data(ts, us)
             l_i.set_data(ts, is_)
-            l_iref.set_data(ts, [0.0]*len(ts))
+            l_iref.set_data(ts, [0.0]*len(ts))  # no current ref in this env, keep as n/a
             l_w.set_data(ts, ws)
             l_wref.set_data(ts, wrefs)
             l_tem.set_data(ts, Tems)
             l_tl.set_data(ts, Tls)
+            # rescale
             for ax in axs:
                 ax.relim(); ax.autoscale_view(True, True, True)
+            # brief pause + optional sleep to match (approx) real-time
             plt.pause(0.001)
-            if wall_dt > 0: time.sleep(wall_dt)
-        if term or trunc: break
+            if wall_dt > 0:
+                time.sleep(wall_dt)
 
-    if args.live:
+        if term or trunc:
+            break
+
+    # ---- finalize ----
+    if live_mode:
         import matplotlib.pyplot as plt
+        axs[3].set_xlabel("t [s]")
         fig.canvas.draw(); fig.canvas.flush_events()
         fig.savefig(os.path.join(RUN_DIR, "eval_live_snapshot.png"), dpi=200)
         plt.ioff(); plt.show()
         print(f"[EVAL] Live snapshot saved to {RUN_DIR}/eval_live_snapshot.png")
     else:
+        # static export
         data = {
             "t": np.array(ts),
             "u": np.array(us),
@@ -573,7 +602,6 @@ def eval_rl(args):
         }
         save_plots(data, f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}", RUN_DIR, live=False)
         print(f"[EVAL] Plots saved under {RUN_DIR}")
-
 # =========================
 # CLI
 # =========================
@@ -586,7 +614,7 @@ def main():
     parser.add_argument("--eval_rl", action="store_true")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None, help="Resume training from saved .zip")
-    parser.add_argument("--t_end", type=float, default=8.0)
+    parser.add_argument("--t_end", type=float, default=5.0)
     parser.add_argument("--dt", type=float, default=1e-4)
     parser.add_argument("--frame_skip", type=int, default=20)
     parser.add_argument("--ep_len_s", type=float, default=8.0)
@@ -595,14 +623,14 @@ def main():
     parser.add_argument("--vis_speed", type=float, default=1.0, help="1.0=realtime, 0.5=2x slower")
     parser.add_argument("--w_ref", type=float, default=160.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tau_act", type=float, default=1e-3, help="Actuator time constant [s]")
+    parser.add_argument("--tau_act", type=float, default=3e-3, help="Actuator time constant [s]")
     # reward weights
     parser.add_argument("--rw_e", type=float, default=4.0)
     parser.add_argument("--rw_u", type=float, default=0.01)
     parser.add_argument("--rw_de", type=float, default=0.02)
     parser.add_argument("--rw_du", type=float, default=0.005)
     parser.add_argument("--rw_i", type=float, default=0.01)
-    # state safety clamps (no voltage cap)
+    # state safety clamps
     parser.add_argument("--i_abs_max", type=float, default=6.0)
     parser.add_argument("--omega_abs_max", type=float, default=900.0)
     args = parser.parse_args()
