@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-motor_rl.py — DC motor RL - controll (TD3, Gymnasium + Stable-Baselines3)
+motor_rl.py — DC motor RL-only (TD3, Gymnasium + Stable-Baselines3)
 
-Robust setup:
+Adds:
+- Reward logging (Monitor CSV) + rewards-per-episode plot after training
+- Saving training parameters (txt + json) to the run folder
+- EVAL CSV EXPORTS: time–voltage, time–current, time–speed, time–torque
+
+Robust setup (no extra u cap):
 - Soft-safety on states (clip + gentle penalties), no early termination
+- Env never returns NaN/Inf (sanitized obs/reward, mid-step guard)
 - Randomized step references (incl. negatives) + domain randomization
 - Huber tracking + (phase-aware) authority penalties + terminal bonus
 - Actuator low-pass (prevents chatter)
 - TD3 with action noise and conservative hyperparams (+ resume training)
+- Live evaluation: slowed playback, autoscaling axes, clear labels
 """
 
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 from dataclasses import dataclass
-import os, math, argparse, warnings, time
+import os, math, argparse, warnings, time, csv, json
 import numpy as np
 from datetime import datetime
 
@@ -92,9 +99,10 @@ class AMax32Motor:
 # References
 # =========================
 def generate_random_steps(duration: float,
-                          min_val=-676.46, max_val=676.46,
-                          min_seg=0.8, max_seg=1.5,
+                          min_val=-600.0, max_val=600.0,
+                          min_seg=0.3, max_seg=1.2,
                           skew_high_prob=0.5, high_lo=300.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Random step sequence, optionally skewed to spend more time at high ω."""
     t_points = [0.0]
     while t_points[-1] < duration:
         t_points.append(min(duration, t_points[-1] + float(np.random.uniform(min_seg, max_seg))))
@@ -119,11 +127,10 @@ def speed_ref_profile(t: float, kind: str, w_ref: float, rand_seq=None) -> float
     if kind == "const":
         return float(w_ref)
     if kind == "step_seq_motor":
-        if t < 0.5: return 0.0
-        if t < 1.0: return 100.0
+        if t < 1.0: return 200.0
         if t < 2.0: return 325.0
         if t < 3.0: return 50.0
-        if t < 4.0: return -150.0
+        if t < 4.0: return 150.0
         return 523.60
     if kind == "rand_steps" and rand_seq is not None:
         t_points, w_values = rand_seq
@@ -149,7 +156,7 @@ class MotorEnv(gym.Env):
     def __init__(self,
                  task="speed",
                  dt=1e-4,
-                 frame_skip=20,            # faster control
+                 frame_skip=20,
                  Vdc=24.0,
                  ulim=1.0,
                  ref_kind_speed="rand_steps",
@@ -163,8 +170,8 @@ class MotorEnv(gym.Env):
                  i_abs_max=6.0,
                  omega_abs_max=900.0,
                  # noise
-                 obs_noise=0.000,
-                 load_noise=0.00,
+                 obs_noise=0.002,
+                 load_noise=0.06,
                  # training disturbances
                  load_step_prob=0.4,
                  base_load=0.02,
@@ -211,7 +218,7 @@ class MotorEnv(gym.Env):
 
         self.rand_seq: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        # obs = [omega_n, i_n, u_n, e_norm, headroom, sin(t)] #sin táplálás nem szükséges
+        # obs = [omega_n, i_n, u_n, e_norm, headroom, sin(t)]
         obs_high = np.ones(6, np.float32)
         self.observation_space = spaces.Box(-obs_high, high=obs_high, dtype=np.float32)
 
@@ -343,18 +350,18 @@ class MotorEnv(gym.Env):
 
             # authority-aware penalties (phase dependent)
             m = self._authority_multiplier()
-            #REWARD FUNCTION
-            r = - ( self.rw_e * huber(e_norm, k=0.05) #Tracking error
-                    + m * self.rw_u  * (u_norm**2) #Control effor penalty
-                    + m * self.rw_du * abs(du_norm) #Actuation rate
-                    + self.rw_de * abs(de_norm) #Error derivative
-                    + self.rw_i  * (i_norm**2) ) #Current magnitude
+            # REWARD FUNCTION
+            r = - ( self.rw_e * huber(e_norm, k=0.05)      # tracking error
+                    + m * self.rw_u  * (u_norm**2)         # control effort
+                    + m * self.rw_du * abs(du_norm)        # actuation rate
+                    + self.rw_de * abs(de_norm)            # error derivative
+                    + self.rw_i  * (i_norm**2) )           # current magnitude
 
             # soft-safety nudges near state clamps
             if abs(self.state.i) > 0.9 * self.i_abs_max:          r -= 0.05
             if abs(self.state.omega) > 0.9 * self.omega_abs_max:   r -= 0.05
 
-            r = float(np.clip(r, -2.0, 0.3)) #Terminal bonus
+            r = float(np.clip(r, -2.0, 0.3))  # step reward clip
             rew_sum += r
 
             self.prev_e_norm = e_norm
@@ -393,6 +400,52 @@ def save_plots(data, title, run_dir, live=False):
     if live: plt.show()
     plt.close(fig)
 
+# ---------- NEW: Reward plotting + params save ----------
+def _read_monitor_rewards(monitor_csv: str) -> List[float]:
+    rewards: List[float] = []
+    if not os.path.exists(monitor_csv): return rewards
+    with open(monitor_csv, "r", newline="") as f:
+        reader = csv.DictReader((row for row in f if not row.startswith("#")))
+        for row in reader:
+            try: rewards.append(float(row["r"]))
+            except Exception: pass
+    return rewards
+
+def plot_training_rewards(monitor_csv: str, run_dir: str, ma_window: int = 50):
+    import matplotlib.pyplot as plt
+    rewards = _read_monitor_rewards(monitor_csv)
+    if not rewards:
+        print(f"[PLOT] No rewards found in {monitor_csv}")
+        return
+    ep = np.arange(1, len(rewards)+1)
+    ma = np.convolve(rewards, np.ones(ma_window)/ma_window, mode="valid") if len(rewards) >= ma_window else None
+
+    plt.figure(figsize=(12,5))
+    plt.plot(ep, rewards, linewidth=1.2, label="Episode reward")
+    if ma is not None:
+        plt.plot(np.arange(ma_window, len(rewards)+1), ma, linewidth=2.0, label=f"MA({ma_window})")
+    plt.grid(True); plt.xlabel("Episode"); plt.ylabel("Reward")
+    plt.title("Training rewards per episode"); plt.legend()
+    out_png = os.path.join(run_dir, "rewards_per_episode.png")
+    out_pdf = os.path.join(run_dir, "rewards_per_episode.pdf")
+    plt.tight_layout(); plt.savefig(out_png, dpi=220); plt.savefig(out_pdf)
+    plt.close()
+    print(f"[PLOT] Saved episodic reward curves → {out_png} / .pdf")
+
+def save_training_params(args, run_dir: str, model_path: str):
+    d = vars(args).copy()
+    d["run_dir"] = run_dir
+    d["model_path"] = model_path
+    txt = os.path.join(run_dir, "train_params.txt")
+    jsn = os.path.join(run_dir, "train_params.json")
+    with open(txt, "w") as f:
+        f.write("=== Training Parameters ===\n")
+        for k in sorted(d.keys()):
+            f.write(f"{k}: {d[k]}\n")
+    with open(jsn, "w") as f:
+        json.dump(d, f, indent=2)
+    print(f"[INFO] Saved training parameters → {txt} / train_params.json")
+
 # =========================
 # RL (TD3) — Train / Evaluate
 # =========================
@@ -428,8 +481,10 @@ def train_rl(args):
         print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
         return
 
-    env = Monitor(make_env(args))
-    eval_env = Monitor(make_env(args))
+    # Log episodes to RUN_DIR/monitor.csv
+    monitor_csv = os.path.join(RUN_DIR, "monitor.csv")
+    env = Monitor(make_env(args), filename=monitor_csv)
+    eval_env = Monitor(make_env(args), filename=None)
 
     print(f"[TRAIN] Export dir: {RUN_DIR}")
     print(f"[TRAIN] TD3 total_timesteps={args.total_timesteps}  frame_skip={args.frame_skip}  ep_len_s={args.ep_len_s}  phase={args.phase.upper()}")
@@ -443,8 +498,10 @@ def train_rl(args):
         if not path.endswith(".zip"): path += ".zip"
         if os.path.exists(path):
             print(f"[TRAIN] Resuming from {path}")
-            model = TD3.load(path, device="auto")
+            from stable_baselines3 import TD3 as _TD3
+            model = _TD3.load(path, device="auto")
             model.set_env(env)
+
     if model is None:
         model = TD3(
             "MlpPolicy",
@@ -452,21 +509,20 @@ def train_rl(args):
             verbose=2,
             device="auto",
             seed=args.seed,
-            learning_rate=1e-3, #kicsit nagyobb learning rate
+            learning_rate=3e-4,
             buffer_size=300_000,
             batch_size=128,
-            learning_starts=10_000, #kicsit nagyobb 10k ra
+            learning_starts=10000,
             train_freq=(1, "step"),
             gradient_steps=1,
             gamma=0.99,
             tau=0.005,
-            policy_kwargs=dict(net_arch=[128, 64]), #128, 64 vagy 256 128
+            policy_kwargs=dict(net_arch=[256, 128]),
             action_noise=action_noise,
             policy_delay=2,
-            target_policy_noise=0.0,
-            target_noise_clip=0.0,
+            target_policy_noise=0.2,
+            target_noise_clip=0.5,
         )
-        #exploration fraction (0.1)
 
     eval_cb = EvalCallback(
         eval_env,
@@ -479,117 +535,109 @@ def train_rl(args):
     )
 
     callbacks = [eval_cb]
-    if have_pbar:
+    if 'have_pbar' in locals() and have_pbar:
         callbacks.append(ProgressBarCallback())
 
     model.learn(total_timesteps=args.total_timesteps, callback=callbacks)
-    path = os.path.join(RUN_DIR, "td3_motor.zip")
-    model.save(path)
-    print(f"[RL] Saved model → {path}")
+    model_path = os.path.join(RUN_DIR, "td3_motor.zip")
+    model.save(model_path)
+    print(f"[RL] Saved model → {model_path}")
+
+    # ---- NEW: post-training artifacts ----
+    plot_training_rewards(monitor_csv, RUN_DIR)
+    save_training_params(args, RUN_DIR, model_path)
+
+# ---------- helper to save eval CSVs ----------
+def _save_series_csv(path: str, t: List[float], y: List[float], headers=("t_s","y")):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+        for ti, yi in zip(t, y):
+            w.writerow([f"{ti:.9f}", f"{yi:.9f}"])
 
 def eval_rl(args):
-    """Live plotting evaluation for a trained TD3 model (or static if --live not set)."""
+    """Live streaming plot with autoscale (& slowed playback) or static plots.
+       Also saves 4 CSVs: time–voltage, time–current, time–speed, time–torque.
+    """
     try:
         from stable_baselines3 import TD3
     except Exception:
-        print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
+        print("Stable-Baselines3 not available. Install: pip install stable-baselines3 torch gymnasium")
         return
 
     if not args.model_path:
         print("--model_path missing.")
         return
     mpath = os.path.expanduser(args.model_path)
-    if not mpath.endswith(".zip"):
-        mpath += ".zip"
+    if not mpath.endswith(".zip"): mpath += ".zip"
     if not os.path.exists(mpath):
         raise FileNotFoundError(f"Model file not found: {mpath}")
 
     env = make_env(args)
     model = TD3.load(mpath, device="auto")
 
-    # ---- evaluation horizon in RL steps ----
-    steps = int(args.t_end / (args.dt * args.frame_skip))
     obs, _ = env.reset(seed=args.seed)
+    steps = int(args.t_end / (args.dt * args.frame_skip))
 
-    # ---- buffers ----
     ts, us, is_, ws, wrefs, Tems, Tls = [], [], [], [], [], [], []
 
-    # ---- live figure (optional) ----
-    live_mode = bool(args.live)
-    if live_mode:
+    if args.live:
         import matplotlib.pyplot as plt
         plt.ion()
         fig, axs = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
-        for ax in axs:
-            ax.grid(True)
-
-        # lines
-        (l_u,)    = axs[0].plot([], [], lw=1.3, label="u")
-        axs[0].set_ylabel("u [V]"); axs[0].legend()
-
-        (l_i,)    = axs[1].plot([], [], lw=1.3, label="i")
+        (l_u,)   = axs[0].plot([], [], lw=1.2, label="u")
+        axs[0].set_ylabel("u [V]"); axs[0].legend(); axs[0].grid(True)
+        (l_i,)   = axs[1].plot([], [], lw=1.2, label="i")
         (l_iref,) = axs[1].plot([], [], "--", lw=1.0, label="i_ref (n/a)")
-        axs[1].set_ylabel("i [A]"); axs[1].legend()
-
-        (l_w,)    = axs[2].plot([], [], lw=1.3, label="ω")
+        axs[1].set_ylabel("i [A]"); axs[1].legend(); axs[1].grid(True)
+        (l_w,)   = axs[2].plot([], [], lw=1.2, label="ω")
         (l_wref,) = axs[2].plot([], [], "--", lw=1.0, label="ω_ref")
-        axs[2].set_ylabel("ω [rad/s]"); axs[2].legend()
-
-        (l_tem,)  = axs[3].plot([], [], lw=1.3, label="T_em")
-        (l_tl,)   = axs[3].plot([], [], "--", lw=1.0, label="T_load")
-        axs[3].set_ylabel("Torque [Nm]"); axs[3].legend()
+        axs[2].set_ylabel("ω [rad/s]"); axs[2].legend(); axs[2].grid(True)
+        (l_tem,) = axs[3].plot([], [], lw=1.2, label="T_em")
+        (l_tl,)  = axs[3].plot([], [], "--", lw=1.0, label="T_load")
+        axs[3].set_ylabel("Torque [Nm]"); axs[3].legend(); axs[3].grid(True)
         axs[3].set_xlabel("t [s]")
-
         fig.suptitle(f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}")
+        wall_dt = (env.frame_skip * env.dt) / max(args.vis_speed, 1e-6)
 
-        # slow down to near real-time (vis_speed=1 → real-time; 0.5 → 2× slower, 2.0 → 2× faster)
-        wall_dt = (env.unwrapped.frame_skip * env.unwrapped.dt) / max(args.vis_speed, 1e-6)
-
-    # ---- rollout ----
     for _ in range(steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, _ = env.step(action)
 
-        # pull signals from unwrapped env (Monitor/TimeLimit safe)
-        ue = env.unwrapped
-        ts.append(ue.t)
-        us.append(ue.prev_u)
-        is_.append(ue.state.i)
-        ws.append(ue.state.omega)
-        wrefs.append(speed_ref_profile(ue.t, ue.ref_kind_speed, ue.w_ref_base, ue.rand_seq))
-        Tems.append(ue.p.kT * ue.state.i)
-        Tls.append(ue.base_load)
+        ts.append(env.t); us.append(env.prev_u); is_.append(env.state.i); ws.append(env.state.omega)
+        wrefs.append(speed_ref_profile(env.t, args.ref_profile, args.w_ref, env.rand_seq))
+        Tems.append(env.p.kT * env.state.i); Tls.append(env.base_load)
 
-        if live_mode:
-            # update lines
+        if args.live:
+            import matplotlib.pyplot as plt
             l_u.set_data(ts, us)
             l_i.set_data(ts, is_)
-            l_iref.set_data(ts, [0.0]*len(ts))  # no current ref in this env, keep as n/a
+            l_iref.set_data(ts, [0.0]*len(ts))
             l_w.set_data(ts, ws)
             l_wref.set_data(ts, wrefs)
             l_tem.set_data(ts, Tems)
             l_tl.set_data(ts, Tls)
-            # rescale
             for ax in axs:
                 ax.relim(); ax.autoscale_view(True, True, True)
-            # brief pause + optional sleep to match (approx) real-time
             plt.pause(0.001)
-            if wall_dt > 0:
-                time.sleep(wall_dt)
+            if wall_dt > 0: time.sleep(wall_dt)
+        if term or trunc: break
 
-        if term or trunc:
-            break
+    # ----- NEW: save requested CSVs -----
+    _save_series_csv(os.path.join(RUN_DIR, "eval_time_voltage.csv"), ts, us, headers=("t_s","u_V"))
+    _save_series_csv(os.path.join(RUN_DIR, "eval_time_current.csv"), ts, is_, headers=("t_s","i_A"))
+    _save_series_csv(os.path.join(RUN_DIR, "eval_time_speed_radps.csv"), ts, ws, headers=("t_s","omega_rad_s"))
+    _save_series_csv(os.path.join(RUN_DIR, "eval_time_torque.csv"), ts, Tems, headers=("t_s","T_em_Nm"))
+    print("[EVAL] Saved CSVs: eval_time_voltage/current/speed_radps/torque.csv")
 
-    # ---- finalize ----
-    if live_mode:
+    if args.live:
         import matplotlib.pyplot as plt
-        axs[3].set_xlabel("t [s]")
         fig.canvas.draw(); fig.canvas.flush_events()
         fig.savefig(os.path.join(RUN_DIR, "eval_live_snapshot.png"), dpi=200)
         plt.ioff(); plt.show()
         print(f"[EVAL] Live snapshot saved to {RUN_DIR}/eval_live_snapshot.png")
     else:
-        # static export
         data = {
             "t": np.array(ts),
             "u": np.array(us),
@@ -602,6 +650,7 @@ def eval_rl(args):
         }
         save_plots(data, f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}", RUN_DIR, live=False)
         print(f"[EVAL] Plots saved under {RUN_DIR}")
+
 # =========================
 # CLI
 # =========================
@@ -614,7 +663,7 @@ def main():
     parser.add_argument("--eval_rl", action="store_true")
     parser.add_argument("--model_path", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None, help="Resume training from saved .zip")
-    parser.add_argument("--t_end", type=float, default=5.0)
+    parser.add_argument("--t_end", type=float, default=8.0)
     parser.add_argument("--dt", type=float, default=1e-4)
     parser.add_argument("--frame_skip", type=int, default=20)
     parser.add_argument("--ep_len_s", type=float, default=8.0)
@@ -623,14 +672,14 @@ def main():
     parser.add_argument("--vis_speed", type=float, default=1.0, help="1.0=realtime, 0.5=2x slower")
     parser.add_argument("--w_ref", type=float, default=160.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tau_act", type=float, default=3e-3, help="Actuator time constant [s]")
+    parser.add_argument("--tau_act", type=float, default=1e-3, help="Actuator time constant [s]")
     # reward weights
     parser.add_argument("--rw_e", type=float, default=4.0)
     parser.add_argument("--rw_u", type=float, default=0.01)
     parser.add_argument("--rw_de", type=float, default=0.02)
     parser.add_argument("--rw_du", type=float, default=0.005)
     parser.add_argument("--rw_i", type=float, default=0.01)
-    # state safety clamps
+    # state safety clamps (no voltage cap)
     parser.add_argument("--i_abs_max", type=float, default=6.0)
     parser.add_argument("--omega_abs_max", type=float, default=900.0)
     args = parser.parse_args()
