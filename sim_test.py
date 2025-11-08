@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Tuple
 from dataclasses import dataclass
-import numpy as np, math, matplotlib
+import numpy as np, math, matplotlib, json
 matplotlib.use("TkAgg")  # interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
@@ -100,6 +100,8 @@ class AMax32Motor:
     def __init__(self, p: AMax32Params | None = None):
         self.p = p or AMax32Params()
         self.d = self.p.derived()
+    def refresh_derived(self):
+        self.d = self.p.derived()
     def derivatives(self, t: float, x: MotorState, u_v: float, load_torque: float) -> MotorState:
         p = self.p
         di = (u_v - p.R * x.i - p.Ke * x.omega) / p.L
@@ -122,7 +124,7 @@ class AMax32Motor:
         k1 = deriv(t, x)
         k2 = deriv(t+0.5*dt, MotorState(x.i+0.5*dt*k1.i, x.omega+0.5*dt*k1.omega,
                                         x.theta+0.5*dt*k1.theta, x.Tw+0.5*dt*k1.Tw))
-        k3 = deriv(t+0.5*dt, MotorState(x.i+0.5*dt*k2.i, x.omega+0.5*dt+k2.omega if False else x.omega+0.5*dt*k2.omega,
+        k3 = deriv(t+0.5*dt, MotorState(x.i+0.5*dt*k2.i, x.omega+0.5*dt*k2.omega,
                                         x.theta+0.5*dt*k2.theta, x.Tw+0.5*dt*k2.Tw))
         k4 = deriv(t+dt, MotorState(x.i+dt*k3.i, x.omega+dt*k3.omega,
                                     x.theta+dt*k3.theta, x.Tw+dt*k3.Tw))
@@ -147,6 +149,55 @@ def pwm_voltage(Vdc=24.0, duty=0.5, freq=5_000.0):
     return u
 
 # ---------------------------
+# Drift parsing/apply
+# ---------------------------
+_SUPPORTED_DRIFT_FIELDS = {"R","L","kT","Ke","J","B","T_coulomb"}
+
+def parse_drift_specs(spec: str) -> List[Tuple[str,str,float]]:
+    """
+    Parses 'R:+20%, L:*1.1, kT:-5%' → [('R','pct',+20.0), ('L','mul',1.1), ('kT','pct',-5.0)]
+    """
+    if not spec: return []
+    out = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token or ":" not in token: continue
+        name, val = token.split(":",1)
+        name = name.strip()
+        if name not in _SUPPORTED_DRIFT_FIELDS: continue
+        val = val.strip().lower()
+        if val.startswith(("+","-")) and val.endswith("%"):
+            out.append((name, "pct", float(val[:-1])))
+        elif val.startswith("*"):
+            out.append((name, "mul", float(val[1:])))
+        else:
+            # fallback: treat as multiplier if it's a number
+            try:
+                out.append((name, "mul", float(val)))
+            except:
+                pass
+    return out
+
+def apply_drifts(motor: AMax32Motor, specs: List[Tuple[str,str,float]]) -> Dict[str,float]:
+    """
+    Applies drifts to motor.p in-place. Returns dict of new values for logging.
+    """
+    changed = {}
+    for (nm, kind, v) in specs:
+        if not hasattr(motor.p, nm): continue
+        cur = float(getattr(motor.p, nm))
+        if kind == "pct":
+            newv = cur * (1.0 + v/100.0)
+        elif kind == "mul":
+            newv = cur * v
+        else:
+            continue
+        setattr(motor.p, nm, newv)
+        changed[nm] = newv
+    motor.refresh_derived()
+    return changed
+
+# ---------------------------
 # Simulation + Live Plot
 # ---------------------------
 _ANIM = None
@@ -158,7 +209,8 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
              speed_ctrl=False, w_ref=160.0, ref_profile='const',
              kps=0.002, kis=0.4, ulim=24.0, avg_pwm=False,
              current_ctrl=False, i_ref=0.5, kpc=2.0, kic=200.0,
-             i_ref_profile='const'):
+             i_ref_profile='const',
+             drift_at: float | None = None, drift: str | None = None):
 
     """w_ref is in rad/s (no rpm anywhere)."""
     global _ANIM
@@ -170,11 +222,11 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
         if ref_profile == 'const':
             return float(w_ref)
         # Example step sequence in rad/s (edit as desired)
-        if t < 1.0: return 262.0     # ~2500 rpm
-        if t < 2.0: return 366.52    # ~3500 rpm
-        if t < 3.0: return -52.36    # ~-500 rpm
-        if t < 4.0: return 157.08    # ~1500 rpm
-        return 523.60                # ~5000 rpm
+        if t < 1.0: return 200.0
+        if t < 2.0: return 325.0
+        if t < 3.0: return 10.0
+        if t < 4.0: return 150.0
+        return 523.60
 
     # Current reference
     def current_ref_fun(t: float) -> float:
@@ -202,6 +254,11 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
     t_buf, u_buf, i_buf, omega_buf, Tem_buf, Tl_buf = [], [], [], [], [], []
     iref_buf, omega_ref_buf = [], []
     exported_once = False
+
+    # Drift bookkeeping
+    drift_specs = parse_drift_specs(drift or "")
+    drift_done = False
+    drift_log = {"applied": False, "t": None, "specs": drift_specs, "new_params": {}}
 
     # Figure
     fig, axs = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
@@ -250,7 +307,7 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
         return line_u, line_i, line_i_ref, line_w, line_w_ref, line_Tem, line_Tl
 
     def update(_frame):
-        nonlocal x, t_now, ui, last_i_ref
+        nonlocal x, t_now, ui, last_i_ref, drift_done, drift_log
         if t_now >= t_end:
             _export_once()
             if _ANIM is not None and _ANIM.event_source is not None:
@@ -259,6 +316,16 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
 
         # integrate several RK4 steps between frames
         for _ in range(steps_per_frame):
+            # ---- mid-run drift -------------------------------------------------
+            if (drift_at is not None) and (not drift_done) and (t_now >= drift_at):
+                newvals = apply_drifts(motor, drift_specs)
+                drift_log = {"applied": True, "t": float(t_now), "specs": drift_specs, "new_params": newvals}
+                with open(os.path.join(RUN_DIR, "drift_applied.json"), "w") as f:
+                    json.dump(drift_log, f, indent=2)
+                print(f"[DRIFT] Applied at t={t_now:.3f}s → {newvals}")
+                drift_done = True
+            # -------------------------------------------------------------------
+
             if current_ctrl:
                 i_ref_now = current_ref_fun(t_now)
 
@@ -275,7 +342,7 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
 
                 if pwm:
                     Veff = V if abs(V) > 1e-9 else 1.0
-                    u_ff = (params.R * i_ref_now + params.Ke * x.omega) / Veff  # volts->duty
+                    u_ff = (motor.p.R * i_ref_now + motor.p.Ke * x.omega) / Veff  # volts->duty
                     duty_pre = (kpc * e_i + ui) + u_ff
                     duty_lim = min(1.0, abs(ulim))
                     duty_sat = _clip(duty_pre, -duty_lim, duty_lim)
@@ -288,7 +355,7 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
                     if abs(duty_pre) > duty_lim + duty_eps:
                         ui += (duty_sat - duty_pre)
                 else:
-                    v_ff = params.R * i_ref_now + params.Ke * x.omega
+                    v_ff = motor.p.R * i_ref_now + motor.p.Ke * x.omega
                     v_pre = (kpc * e_i + ui) + v_ff
                     v_sat = _clip(v_pre, -abs(ulim), +abs(ulim))
                     u = v_sat
@@ -322,7 +389,7 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
             # log BEFORE step
             t_buf.append(t_now); u_buf.append(u)
             i_buf.append(x.i);   omega_buf.append(x.omega)
-            Tem_buf.append(params.kT * x.i); Tl_buf.append(Tl)
+            Tem_buf.append(motor.p.kT * x.i); Tl_buf.append(Tl)
             iref_buf.append(i_ref_now_log); omega_ref_buf.append(omega_ref_now)
 
             x = AMax32Motor.rk4_step(lambda tau, s: motor.derivatives(tau, s, u, Tl),
@@ -431,6 +498,19 @@ def run_live(t_end=2.0, dt=1e-4, V=24.0, Tload=0.02,
         }
         export_subplot_csvs("live_full", t_ds, y_full, run_dir=RUN_DIR)
 
+        # Save drift log if not already
+        with open(os.path.join(RUN_DIR, "run_meta.json"), "w") as f:
+            json.dump({
+                "args": {
+                    "t_end": t_end, "dt": dt, "V": V, "Tload": Tload,
+                    "pwm": pwm, "avg_pwm": avg_pwm, "speed_ctrl": speed_ctrl,
+                    "w_ref": w_ref, "ref_profile": ref_profile,
+                    "kps": kps, "kis": kis, "ulim": ulim,
+                    "current_ctrl": current_ctrl, "i_ref": i_ref, "kpc": kpc, "kic": kic
+                },
+                "drift": drift_log
+            }, f, indent=2)
+
         # Static full-run figure
         fig2, axs2 = plt.subplots(4, 1, figsize=(9, 10), sharex=True)
         axs2[0].plot(t_ds, y_full['u']);     axs2[0].set_ylabel('u [V]');    axs2[0].grid(True)
@@ -489,6 +569,12 @@ if __name__ == "__main__":
     parser.add_argument('--kpc', type=float, default=1.0)
     parser.add_argument('--kic', type=float, default=50.0)
 
+    # Drift
+    parser.add_argument('--drift_at', type=float, default=None,
+                        help='Time [s] to apply parameter drift (e.g., 1.5)')
+    parser.add_argument('--drift', type=str, default=None,
+                        help='Comma-separated specs: "R:+20%, L:*1.1, kT:-5%". Supported: R,L,kT,Ke,J,B,T_coulomb')
+
     args = parser.parse_args()
 
     run_live(t_end=args.t_end, dt=args.dt, V=args.V, Tload=args.Tload,
@@ -498,4 +584,5 @@ if __name__ == "__main__":
              speed_ctrl=args.speed_ctrl, w_ref=args.w_ref, ref_profile=args.ref_profile,
              kps=args.kps, kis=args.kis, ulim=args.ulim, avg_pwm=args.avg_pwm,
              current_ctrl=args.current_ctrl, i_ref=args.i_ref, kpc=args.kpc, kic=args.kic,
-             i_ref_profile=args.i_ref_profile)
+             i_ref_profile=args.i_ref_profile,
+             drift_at=args.drift_at, drift=args.drift)

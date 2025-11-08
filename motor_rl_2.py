@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-motor_rl.py — DC motor RL-only (TD3, Gymnasium + Stable-Baselines3)
+motor_rl.py — DC motor RL control (TD3, Gymnasium + Stable-Baselines3)
 
-Adds:
-- Reward logging (Monitor CSV) + rewards-per-episode plot after training
-- Saving training parameters (txt + json) to the run folder
-- EVAL CSV EXPORTS: time–voltage, time–current, time–speed, time–torque
-- MID-EPISODE PARAMETER DRIFT: --drift_at t(s), --drift "R:+20%, kT:-10%, L:*1.1"
-
-Robust setup (no extra u cap):
-- Soft-safety on states (clip + gentle penalties), no early termination
-- Env never returns NaN/Inf (sanitized obs/reward, mid-step guard)
-- Randomized step references (incl. negatives) + domain randomization
-- Huber tracking + (phase-aware) authority penalties + terminal bonus
-- Actuator low-pass (prevents chatter)
-- TD3 with action noise and conservative hyperparams (+ resume training)
-- Live evaluation: slowed playback, autoscaling axes, clear labels
+Includes:
+- warmup_zero_s: first seconds of each episode track ω_ref=0 (train & eval)
+- HOLD latch with hysteresis (band_in / band_out) to discourage dithering
+- Anti-chatter: |Δu| penalty + u^2 penalty near target
+- Positive band bonus when close to target (stronger when latched)
+- Hard duty rate limit max_du (+ tighter max_du_hold while latched)
+- Actuator low-pass
+- Domain randomization curriculum (phase=a/b)
+- TimeLimit wrapper
+- Live plotting during evaluation (--live)
+- Reward saturation (configurable) to keep per-step rewards bounded
+- AFTER TRAINING: plot episodic rewards and save training parameters to RUN_DIR
+- LOW-SPEED HELPERS:
+    * e_int (leaky integral of error) in observation
+    * reference-aware u^2 penalty (weaker when |ω_ref| small)
+    * low-speed duty “floor” encouragement when latched
 """
 
-from typing import Tuple, Optional, List, Dict
+from typing import Tuple, Optional, List
 from dataclasses import dataclass
 import os, math, argparse, warnings, time, csv, json
 import numpy as np
@@ -74,8 +76,6 @@ class AMax32Motor:
     def __init__(self, p: Optional[AMax32Params] = None):
         self.p = p or AMax32Params()
         self.d = self.p.derived()
-    def refresh_derived(self):  # used after drifts
-        self.d = self.p.derived()
     def derivatives(self, t, x: MotorState, u_v: float, load_torque: float) -> MotorState:
         p = self.p
         di = (u_v - p.R * x.i - p.Ke * x.omega) / p.L
@@ -99,53 +99,13 @@ class AMax32Motor:
         )
 
 # =========================
-# Drift parsing/apply
-# =========================
-_SUPPORTED_DRIFT_FIELDS = {"R","L","kT","Ke","J","B","T_coulomb"}
-
-def parse_drift_specs(spec: Optional[str]) -> List[tuple]:
-    """
-    'R:+20%, L:*1.1, kT:-5%' → [('R','pct',20.0), ('L','mul',1.1), ('kT','pct',-5.0)]
-    """
-    if not spec: return []
-    out = []
-    for token in spec.split(","):
-        token = token.strip()
-        if not token or ":" not in token: continue
-        name, val = token.split(":",1)
-        name = name.strip()
-        if name not in _SUPPORTED_DRIFT_FIELDS: continue
-        v = val.strip().lower()
-        if (v.startswith("+") or v.startswith("-")) and v.endswith("%"):
-            out.append((name, "pct", float(v[:-1])))
-        elif v.startswith("*"):
-            out.append((name, "mul", float(v[1:])))
-        else:
-            try:
-                out.append((name, "mul", float(v)))
-            except:
-                pass
-    return out
-
-def apply_drifts(motor: AMax32Motor, specs: List[tuple]) -> Dict[str, float]:
-    changed = {}
-    for (nm, kind, v) in specs:
-        if not hasattr(motor.p, nm): continue
-        cur = float(getattr(motor.p, nm))
-        newv = cur * (1.0 + v/100.0) if kind == "pct" else cur * v
-        setattr(motor.p, nm, newv)
-        changed[nm] = newv
-    motor.refresh_derived()
-    return changed
-
-# =========================
 # References
 # =========================
 def generate_random_steps(duration: float,
-                          min_val=-600.0, max_val=600.0,
-                          min_seg=0.3, max_seg=1.2,
+                          min_val=-676.46, max_val=676.46,
+                          min_seg=0.8, max_seg=1.5,
                           skew_high_prob=0.5, high_lo=300.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Random step sequence, optionally skewed to spend more time at high ω."""
+    """Random step sequence."""
     t_points = [0.0]
     while t_points[-1] < duration:
         t_points.append(min(duration, t_points[-1] + float(np.random.uniform(min_seg, max_seg))))
@@ -170,11 +130,12 @@ def speed_ref_profile(t: float, kind: str, w_ref: float, rand_seq=None) -> float
     if kind == "const":
         return float(w_ref)
     if kind == "step_seq_motor":
-        if t < 1.0: return 200.0
+        if t < 0.5: return 0.0          # warm-up zero
+        if t < 1.0: return 100.0
         if t < 2.0: return 325.0
-        if t < 3.0: return 10.0     # ez 50 volt
-        if t < 4.0: return 150.0
-        return 400.0
+        if t < 3.0: return 50.0
+        if t < 4.0: return -150.0
+        return 523.60
     if kind == "rand_steps" and rand_seq is not None:
         t_points, w_values = rand_seq
         return random_speed_ref(t, t_points, w_values)
@@ -186,6 +147,7 @@ def speed_ref_profile(t: float, kind: str, w_ref: float, rand_seq=None) -> float
 try:
     import gymnasium as gym
     from gymnasium import spaces
+    from gymnasium.wrappers import TimeLimit
 except Exception:
     gym = None
     warnings.warn("Gymnasium not available. Install: pip install gymnasium")
@@ -194,7 +156,7 @@ def huber(x: float, k: float = 0.05) -> float:
     ax = abs(x)
     return (0.5 * (ax**2) / k) if ax <= k else (ax - 0.5 * k)
 
-class MotorEnv(gym.Env):
+class MotorEnv(gym.Env):  # type: ignore[misc]
     metadata = {"render_modes": []}
     def __init__(self,
                  task="speed",
@@ -209,63 +171,107 @@ class MotorEnv(gym.Env):
                  ep_len_s=8.0,
                  # phase profile for domain rand / noise
                  phase="b",
-                 # state safety (no voltage cap)
+                 # state safety
                  i_abs_max=6.0,
                  omega_abs_max=900.0,
                  # noise
-                 obs_noise=0.002,
-                 load_noise=0.06,
-                 # training disturbances
+                 obs_noise=0.000,
+                 load_noise=0.00,
+                 # disturbances
                  load_step_prob=0.4,
                  base_load=0.02,
                  # actuator lag
                  tau_act=1e-3,
-                 # ---- NEW: drift controls ----
-                 drift_at: Optional[float] = None,
-                 drift_specs: Optional[List[tuple]] = None):
+                 # warm-up / HOLD shaping
+                 warmup_zero_s=0.5,
+                 e_small=0.04,
+                 hold_w=0.003,
+                 hold_u_w=0.01,
+                 # duty rate limits
+                 max_du=0.02,
+                 max_du_hold=0.005,
+                 # band bonus + hysteresis
+                 r_band=0.02,
+                 r_band_latched=0.035,
+                 band_in=0.03,
+                 band_out=0.05,
+                 # reward saturation (per-step)
+                 reward_lo=-1.0,
+                 reward_hi=0.3,
+                 # LOW-SPEED helpers
+                 eint_tau=0.30,
+                 w_low_radps=120.0,
+                 u_min_hold_low=0.05,
+                 k_under_u_low=0.02,
+                 **_):
         assert task == "speed"
         self.task, self.dt, self.frame_skip = task, dt, frame_skip
         self.Vdc_nom = Vdc
         self.ulim = ulim
         self.ref_kind_speed, self.w_ref_base = ref_kind_speed, w_ref
 
+        # reward weights
         self.rw_e, self.rw_u, self.rw_de, self.rw_du, self.rw_i = rw_e, rw_u, rw_de, rw_du, rw_i
         self.ep_len_s = float(ep_len_s)
         self.max_rl_steps = max(1, int(self.ep_len_s / (self.dt * self.frame_skip)))
 
+        # curriculum / domain randomization
         self.phase = phase
         self.base_load = base_load
         self.load_step_prob = load_step_prob
         self.load_noise = float(load_noise)
         self.obs_noise = float(obs_noise)
 
-        # state soft-clamps (no hard cap on voltage)
+        # state soft-clamps
         self.i_abs_max = float(i_abs_max)
         self.omega_abs_max = float(omega_abs_max)
         self.i_env_max = 1.2 * self.i_abs_max
         self.omega_env_max = 1.2 * self.omega_abs_max
 
-        # actuator low-pass
+        # actuator
         self.tau_act = float(tau_act)
         self.u_applied = 0.0
 
-        # authority scaling (phase-dependent; set in reset)
-        self.authority_gain = 1.5
+        # warm-up + HOLD + rate limit
+        self.warmup_zero_s = float(warmup_zero_s)
+        self.e_small = float(e_small)
+        self.hold_w = float(hold_w)
+        self.hold_u_w = float(hold_u_w)
+        self.max_du = float(max_du)
+        self.max_du_hold = float(max_du_hold)
 
+        # band & hysteresis
+        self.r_band = float(r_band)
+        self.r_band_latched = float(r_band_latched)
+        self.band_in = float(band_in)
+        self.band_out = float(band_out)
+        self.hold_latched = False
+
+        # reward saturation
+        self.reward_lo = float(reward_lo)
+        self.reward_hi = float(reward_hi)
+
+        # LOW-SPEED helpers
+        self.eint_tau = float(eint_tau)
+        self.w_low_radps = float(w_low_radps)
+        self.u_min_hold_low = float(u_min_hold_low)  # in duty fraction (0..1)
+        self.k_under_u_low = float(k_under_u_low)
+
+        # internals
         self.p = AMax32Params()
         self.motor = AMax32Motor(self.p)
         self.state = MotorState(0.0, 0.0, 0.0, self.p.T_amb)
-
         self.t = 0.0
         self.prev_u = 0.0
         self.prev_e_norm = 0.0
         self.prev_duty = 0.0
         self.rl_step_count = 0
+        self.e_int = 0.0  # leaky integral of normalized error
 
+        # observation/action spaces (7 dims with e_int)
         self.rand_seq: Optional[Tuple[np.ndarray, np.ndarray]] = None
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
-        # obs = [omega_n, i_n, u_n, e_norm, headroom, sin(t)]
-        obs_high = np.ones(6, np.float32)
+        obs_high = np.ones(7, np.float32)  # [omega_n, i_n, u_n, e_norm, headroom, sin(t), e_int]
         self.observation_space = spaces.Box(-obs_high, high=obs_high, dtype=np.float32)
 
         # runtime-randomized parameters (set in reset)
@@ -273,54 +279,41 @@ class MotorEnv(gym.Env):
         self.load_torque = self.base_load
         self.load_bump = 0.0
 
-        # ---- NEW: drift state ----
-        self.drift_at = drift_at
-        self.drift_specs = drift_specs or []
-        self._drift_applied = False
-
     # ------------- helpers
     def _current_wref(self) -> float:
+        if self.t < self.warmup_zero_s:
+            return 0.0
         return speed_ref_profile(self.t, self.ref_kind_speed, self.w_ref_base, self.rand_seq)
 
     def _finite(self) -> bool:
         s = self.state
         return np.isfinite(s.i) and np.isfinite(s.omega)
 
-    def _headroom(self) -> float:
-        """0..1: how much volt headroom remains after back-EMF."""
-        Vemf = abs(self.motor.p.Ke * self.state.omega)
-        return float(np.clip((self.Vdc - Vemf) / max(self.Vdc, 1e-6), 0.0, 1.0))
-
-    def _authority_multiplier(self) -> float:
-        """Penalty scaling; Phase B sets authority_gain=0 to avoid discouraging high-ω control."""
-        return 1.0 + self.authority_gain * (1.0 - self._headroom())
-
     # ------------- Gym API
     def reset(self, *, seed=None, options=None):
+        self.hold_latched = False
+        self.e_int = 0.0
         if seed is not None:
             np.random.seed(seed)
 
-        # --- PHASE curriculum ---
+        # PHASE domain randomization
+        scale = lambda x, pct: float(x * np.random.uniform(1 - pct, 1 + pct))
         if self.phase.lower() == "a":
-            scale = lambda x, pct: float(x * np.random.uniform(1 - pct, 1 + pct))
             self.p.R = scale(self.p.R, 0.10); self.p.L = scale(self.p.L, 0.10)
             self.p.J = scale(self.p.J, 0.10); self.p.B = scale(self.p.B, 0.15)
             self.p.kT = scale(self.p.kT, 0.08); self.p.Ke = scale(self.p.Ke, 0.08)
             self.Vdc  = scale(self.Vdc_nom, 0.05)
             self.base_load = scale(self.base_load, 0.20)
             self.load_noise = 0.06; self.obs_noise = 0.002
-            self.authority_gain = 1.5
             self.rand_seq = generate_random_steps(self.ep_len_s, -500.0, 500.0, 0.4, 1.1, skew_high_prob=0.4) \
                             if self.ref_kind_speed == "rand_steps" else None
         else:
-            scale = lambda x, pct: float(x * np.random.uniform(1 - pct, 1 + pct))
             self.p.R = scale(self.p.R, 0.20); self.p.L = scale(self.p.L, 0.20)
             self.p.J = scale(self.p.J, 0.25); self.p.B = scale(self.p.B, 0.30)
             self.p.kT = scale(self.p.kT, 0.15); self.p.Ke = scale(self.p.Ke, 0.15)
             self.Vdc  = scale(self.Vdc_nom, 0.10)
             self.base_load = scale(self.base_load, 0.35)
             self.load_noise = 0.10; self.obs_noise = 0.003
-            self.authority_gain = 0.0
             self.rand_seq = generate_random_steps(self.ep_len_s, -650.0, 650.0, 0.3, 1.0, skew_high_prob=0.6) \
                             if self.ref_kind_speed == "rand_steps" else None
 
@@ -336,41 +329,24 @@ class MotorEnv(gym.Env):
         self.t = 0.0
         self.prev_u = 0.0
         self.prev_duty = 0.0
-        self.u_applied = 0.0
+        self.u_applied = 0.0  # actuator state
         wref0 = self._current_wref()
         self.prev_e_norm = float(np.clip((wref0 - self.state.omega) / 900.0, -1.0, 1.0))
         self.rl_step_count = 0
-
-        # reset drift flag per episode
-        self._drift_applied = False
-
         return self._obs(), {}
-
-    def _maybe_apply_drift(self):
-        if (self.drift_at is not None) and (not self._drift_applied) and (self.t >= self.drift_at):
-            newvals = apply_drifts(self.motor, self.drift_specs)
-            self._drift_applied = True
-            log = {"applied": True, "t": float(self.t), "specs": self.drift_specs, "new_params": newvals}
-            # best-effort log to RUN_DIR (may fail if write-restricted)
-            try:
-                with open(os.path.join(RUN_DIR, "drift_applied.json"), "w") as f:
-                    json.dump(log, f, indent=2)
-            except Exception:
-                pass
-            print(f"[DRIFT] Applied at t={self.t:.3f}s → {newvals}")
 
     def _obs(self):
         # soft clamp internal state
-        self.state.i = float(np.clip(self.state.i, -self.i_env_max, self.i_env_max))
-        self.state.omega = float(np.clip(self.state.omega, -self.omega_env_max, self.omega_env_max))
+        self.state.i = float(np.clip(self.state.i, -1.2*self.i_abs_max, 1.2*self.i_abs_max))
+        self.state.omega = float(np.clip(self.state.omega, -1.2*self.omega_abs_max, 1.2*self.omega_abs_max))
 
         omega_n = float(np.clip(self.state.omega / 900.0, -1.0, 1.0))
         i_n     = float(np.clip(self.state.i     / 6.0,   -1.0, 1.0))
         u_n     = float(np.clip(self.prev_u      / self.Vdc, -1.0, 1.0))
         e_norm  = float(np.clip((self._current_wref() - self.state.omega) / 900.0, -1.0, 1.0))
-        headroom = self._headroom()
+        headroom = float(np.clip((self.Vdc - abs(self.motor.p.Ke * self.state.omega)) / max(self.Vdc, 1e-6), 0.0, 1.0))
         s = float(np.sin(self.t))
-        obs = np.array([omega_n, i_n, u_n, e_norm, headroom, s], dtype=np.float32)
+        obs = np.array([omega_n, i_n, u_n, e_norm, headroom, s, float(np.clip(self.e_int, -1.0, 1.0))], dtype=np.float32)
         if self.obs_noise > 0.0:
             obs = np.clip(obs + np.random.normal(0.0, self.obs_noise, size=obs.shape).astype(np.float32), -1.0, 1.0)
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
@@ -382,17 +358,27 @@ class MotorEnv(gym.Env):
             obs, _ = self.reset()
             return obs, 0.0, False, True, {}
 
-        duty = float(np.clip(action[0], -self.ulim, self.ulim))
-        u_cmd = self.Vdc * duty  # <-- no extra clamp on u
+        # raw agent duty within [-ulim, ulim]
+        raw_duty = float(np.clip(action[0], -self.ulim, self.ulim))
+
+        # hysteresis latch on error band (based on previous e_norm)
+        abs_e = abs(self.prev_e_norm)
+        if not self.hold_latched and abs_e < self.band_in:
+            self.hold_latched = True
+        elif self.hold_latched and abs_e > self.band_out:
+            self.hold_latched = False
+
+        # duty rate limit (tighter when latched)
+        du_limit = self.max_du_hold if self.hold_latched else self.max_du
+        duty = float(np.clip(raw_duty, self.prev_duty - du_limit, self.prev_duty + du_limit))
+
+        u_cmd = self.Vdc * duty
         rew_sum = 0.0
 
         for _ in range(self.frame_skip):
-            # ---- maybe apply parameter drift ----
-            self._maybe_apply_drift()
-
             # actuator low-pass: u_applied <- u_cmd
-            alpha = self.dt / max(self.tau_act, 1e-6)
-            self.u_applied += alpha * (u_cmd - self.u_applied)
+            alpha_lp = self.dt / max(self.tau_act, 1e-6)
+            self.u_applied += alpha_lp * (u_cmd - self.u_applied)
             u_eff = self.u_applied
 
             # load: base + noise + optional bump
@@ -400,7 +386,7 @@ class MotorEnv(gym.Env):
             if self.load_bump and self.t >= self.load_bump[0]:
                 Tl += self.load_bump[1]
 
-            # integrate
+            # integrate plant
             self.state = AMax32Motor.rk4_step(
                 lambda tau, s: self.motor.derivatives(tau, s, u_eff, Tl),
                 self.t, self.dt, self.state
@@ -409,41 +395,59 @@ class MotorEnv(gym.Env):
 
             if not self._finite():
                 obs, _ = self.reset()
-                return obs, -0.2, False, True, {}
+                return obs, self.reward_lo, False, True, {}
 
             # normalized vars
             wref   = self._current_wref()
             e_norm = float(np.clip((wref - self.state.omega) / 900.0, -1.0, 1.0))
             u_norm = float(np.clip(u_eff / self.Vdc, -1.0, 1.0))
-            de_norm = e_norm - self.prev_e_norm
             du_norm = duty - self.prev_duty
-            i_norm  = float(np.clip(self.state.i / 6.0, -1.0, 1.0))
 
-            # authority-aware penalties (phase dependent)
-            m = self._authority_multiplier()
-            # REWARD FUNCTION
-            r = - ( self.rw_e * huber(e_norm, k=0.05)      # tracking error
-                    + m * self.rw_u  * (u_norm**2)         # control effort
-                    + m * self.rw_du * abs(du_norm)        # actuation rate
-                    + self.rw_de * abs(de_norm)            # error derivative
-                    + self.rw_i  * (i_norm**2) )           # current magnitude
+            # --- leaky integral of error (normalized)
+            if self.eint_tau > 1e-6:
+                alpha = self.dt / self.eint_tau
+                self.e_int = (1.0 - alpha)*self.e_int + alpha*e_norm
+                self.e_int = float(np.clip(self.e_int, -1.0, 1.0))
 
-            # soft-safety nudges near state clamps
+            # -------- REWARD (with saturation) --------
+            r = - ( self.rw_e * huber(e_norm, k=0.05) )
+
+            # reference-aware u^2 penalty scaling: weak at tiny |ω_ref|
+            ref_mag = float(np.clip(abs(wref) / max(self.w_low_radps, 1e-6), 0.0, 1.0))
+            hold_u_w_eff = self.hold_u_w * (0.2 + 0.8*ref_mag)
+
+            if abs(e_norm) < self.e_small:
+                # bonus for being in band (stronger when latched)
+                r += (self.r_band_latched if self.hold_latched else self.r_band)
+                factor = (2.0 if self.hold_latched else 1.0)
+                r -= factor*self.hold_w     * abs(du_norm)
+                r -= factor*hold_u_w_eff    * (u_norm**2)
+
+                # low-speed “push” to overcome stiction when latched
+                if abs(wref) > 1e-6 and abs(wref) <= self.w_low_radps and self.hold_latched:
+                    shortfall = max(0.0, self.u_min_hold_low - abs(duty))
+                    r -= self.k_under_u_low * shortfall
+
+            # soft-safety nudges near clamps
             if abs(self.state.i) > 0.9 * self.i_abs_max:          r -= 0.05
             if abs(self.state.omega) > 0.9 * self.omega_abs_max:   r -= 0.05
 
-            r = float(np.clip(r, -2.0, 0.3))  # step reward clip
+            # per-step reward saturation
+            r = float(np.clip(r, self.reward_lo, self.reward_hi))
             rew_sum += r
 
+            # update prev signals at fast timescale
             self.prev_e_norm = e_norm
-            self.prev_duty = duty
             self.prev_u = float(u_eff)
+            self.prev_duty = duty
 
-        # terminal bonus for good tracking
+        # mild terminal encouragement if ending close
         if (self.rl_step_count + 1) >= self.max_rl_steps and abs(self.prev_e_norm) < 0.03:
-            rew_sum += 0.2
+            rew_sum += min(0.2, self.reward_hi)
 
-        rew_sum = float(np.clip(np.nan_to_num(rew_sum, nan=0.0, posinf=0.0, neginf=-1.0), -10.0, 10.0))
+        # clip whole-step sum (numerical guard)
+        rew_sum = float(np.clip(np.nan_to_num(rew_sum, nan=0.0, posinf=0.0, neginf=self.reward_lo),
+                                10*self.reward_lo, 10*self.reward_hi))
 
         self.rl_step_count += 1
         truncated = self.rl_step_count >= self.max_rl_steps
@@ -456,8 +460,7 @@ def save_plots(data, title, run_dir, live=False):
     import matplotlib.pyplot as plt
     t = data["t"]
     fig, axs = plt.subplots(4,1,figsize=(11,10),sharex=True)
-    axs[0].plot(t,data["u"], label="u")
-    axs[0].set_ylabel("u [V]"); axs[0].legend(); axs[0].grid(True)
+    axs[0].plot(t,data["u"], label="u"); axs[0].set_ylabel("u [V]"); axs[0].legend(); axs[0].grid(True)
     axs[1].plot(t,data["i"],label="i"); axs[1].plot(t,data["i_ref"],"--",label="i_ref (n/a)")
     axs[1].set_ylabel("i [A]"); axs[1].legend(); axs[1].grid(True)
     axs[2].plot(t,data["omega"],label="ω"); axs[2].plot(t,data["omega_ref"],"--",label="ω_ref")
@@ -471,15 +474,18 @@ def save_plots(data, title, run_dir, live=False):
     if live: plt.show()
     plt.close(fig)
 
-# ---------- NEW: Reward plotting + params save ----------
+# ---------- Training rewards plotting ----------
 def _read_monitor_rewards(monitor_csv: str) -> List[float]:
     rewards: List[float] = []
-    if not os.path.exists(monitor_csv): return rewards
+    if not os.path.exists(monitor_csv):
+        return rewards
     with open(monitor_csv, "r", newline="") as f:
         reader = csv.DictReader((row for row in f if not row.startswith("#")))
         for row in reader:
-            try: rewards.append(float(row["r"]))
-            except Exception: pass
+            try:
+                rewards.append(float(row["r"]))
+            except Exception:
+                pass
     return rewards
 
 def plot_training_rewards(monitor_csv: str, run_dir: str, ma_window: int = 50):
@@ -491,16 +497,14 @@ def plot_training_rewards(monitor_csv: str, run_dir: str, ma_window: int = 50):
     ep = np.arange(1, len(rewards)+1)
     ma = np.convolve(rewards, np.ones(ma_window)/ma_window, mode="valid") if len(rewards) >= ma_window else None
 
-    plt.figure(figsize=(12,5))
-    plt.plot(ep, rewards, linewidth=1.2, label="Episode reward")
+    plt.figure(figsize=(10,5))
+    plt.plot(ep, rewards, linewidth=1.0, label="Episode reward")
     if ma is not None:
         plt.plot(np.arange(ma_window, len(rewards)+1), ma, linewidth=2.0, label=f"MA({ma_window})")
-    plt.grid(True); plt.xlabel("Episode"); plt.ylabel("Reward")
-    plt.title("Training rewards per episode"); plt.legend()
+    plt.grid(True); plt.xlabel("Episode"); plt.ylabel("Reward"); plt.title("Training rewards per episode"); plt.legend()
     out_png = os.path.join(run_dir, "rewards_per_episode.png")
     out_pdf = os.path.join(run_dir, "rewards_per_episode.pdf")
-    plt.tight_layout(); plt.savefig(out_png, dpi=220); plt.savefig(out_pdf)
-    plt.close()
+    plt.tight_layout(); plt.savefig(out_png, dpi=200); plt.savefig(out_pdf); plt.close()
     print(f"[PLOT] Saved episodic reward curves → {out_png} / .pdf")
 
 def save_training_params(args, run_dir: str, model_path: str):
@@ -521,7 +525,7 @@ def save_training_params(args, run_dir: str, model_path: str):
 # RL (TD3) — Train / Evaluate
 # =========================
 def make_env(args):
-    return MotorEnv(
+    env = MotorEnv(
         task=args.task,
         dt=args.dt,
         frame_skip=args.frame_skip,
@@ -535,33 +539,55 @@ def make_env(args):
         i_abs_max=args.i_abs_max,
         omega_abs_max=args.omega_abs_max,
         tau_act=args.tau_act,
-        # pass drift options
-        drift_at=args.drift_at,
-        drift_specs=parse_drift_specs(args.drift)
+        warmup_zero_s=args.warmup_zero_s,
+        e_small=args.e_small,
+        hold_w=args.hold_w,
+        hold_u_w=args.hold_u_w,
+        max_du=args.max_du,
+        max_du_hold=args.max_du_hold,
+        r_band=args.r_band,
+        r_band_latched=args.r_band_latched,
+        band_in=args.band_in,
+        band_out=args.band_out,
+        reward_lo=args.reward_lo,
+        reward_hi=args.reward_hi,
+        # low-speed helpers
+        eint_tau=args.eint_tau,
+        w_low_radps=args.w_low_radps,
+        u_min_hold_low=args.u_min_hold_low,
+        k_under_u_low=args.k_under_u_low,
     )
+    try:
+        from gymnasium.wrappers import TimeLimit
+        return TimeLimit(env, max_episode_steps=env.max_rl_steps)
+    except Exception:
+        return env
 
 def train_rl(args):
     try:
         from stable_baselines3 import TD3
         from stable_baselines3.common.noise import NormalActionNoise
         from stable_baselines3.common.monitor import Monitor
-        from stable_baselines3.common.callbacks import EvalCallback
-        try:
-            from stable_baselines3.common.callbacks import ProgressBarCallback
-            have_pbar = True
-        except Exception:
-            have_pbar = False
+        from stable_baselines3.common.callbacks import EvalCallback, ProgressBarCallback
+        have_pbar = True
     except Exception:
-        print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
-        return
+        try:
+            from stable_baselines3 import TD3
+            from stable_baselines3.common.noise import NormalActionNoise
+            from stable_baselines3.common.monitor import Monitor
+            from stable_baselines3.common.callbacks import EvalCallback
+            have_pbar = False
+        except Exception:
+            print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
+            return
 
-    # Log episodes to RUN_DIR/monitor.csv
-    monitor_csv = os.path.join(RUN_DIR, "monitor.csv")
-    env = Monitor(make_env(args), filename=monitor_csv)
+    # write monitor.csv inside RUN_DIR so we can plot later
+    monitor_path = os.path.join(RUN_DIR, "monitor.csv")
+    env = Monitor(make_env(args), filename=monitor_path)
     eval_env = Monitor(make_env(args), filename=None)
 
     print(f"[TRAIN] Export dir: {RUN_DIR}")
-    print(f"[TRAIN] TD3 total_timesteps={args.total_timesteps}  frame_skip={args.frame_skip}  ep_len_s={args.ep_len_s}  phase={args.phase.upper()}")
+    print(f"[TRAIN] TD3 total_timesteps={args.total_timesteps}  frame_skip={args.frame_skip}  ep_len_s={args.ep_len_s}  phase={args.phase.upper()}  warmup_zero_s={args.warmup_zero_s}")
 
     action_noise = NormalActionNoise(mean=np.zeros(1), sigma=0.10 * np.ones(1))
 
@@ -572,8 +598,7 @@ def train_rl(args):
         if not path.endswith(".zip"): path += ".zip"
         if os.path.exists(path):
             print(f"[TRAIN] Resuming from {path}")
-            from stable_baselines3 import TD3 as _TD3
-            model = _TD3.load(path, device="auto")
+            model = TD3.load(path, device="auto")
             model.set_env(env)
 
     if model is None:
@@ -583,19 +608,19 @@ def train_rl(args):
             verbose=2,
             device="auto",
             seed=args.seed,
-            learning_rate=3e-4,
-            buffer_size=300_000,  # consider 100k if needed
+            learning_rate=1e-3,
+            buffer_size=300_000,
             batch_size=128,
-            learning_starts=10000,
+            learning_starts=10_000,
             train_freq=(1, "step"),
             gradient_steps=1,
             gamma=0.99,
             tau=0.005,
-            policy_kwargs=dict(net_arch=[256, 128]),
+            policy_kwargs=dict(net_arch=[128, 64]),
             action_noise=action_noise,
             policy_delay=2,
-            target_policy_noise=0.2,
-            target_noise_clip=0.5,
+            target_policy_noise=0.0,
+            target_noise_clip=0.0,
         )
 
     eval_cb = EvalCallback(
@@ -618,26 +643,15 @@ def train_rl(args):
     print(f"[RL] Saved model → {model_path}")
 
     # ---- post-training artifacts ----
-    plot_training_rewards(monitor_csv, RUN_DIR)
+    plot_training_rewards(monitor_path, RUN_DIR)
     save_training_params(args, RUN_DIR, model_path)
 
-# ---------- helper to save eval CSVs ----------
-def _save_series_csv(path: str, t: List[float], y: List[float], headers=("t_s","y")):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(headers)
-        for ti, yi in zip(t, y):
-            w.writerow([f"{ti:.9f}", f"{yi:.9f}"])
-
 def eval_rl(args):
-    """Live streaming plot with autoscale (& slowed playback) or static plots.
-       Also saves 4 CSVs: time–voltage, time–current, time–speed, time–torque.
-    """
+    """Live plotting evaluation for a trained TD3 model (or static if --live not set)."""
     try:
         from stable_baselines3 import TD3
     except Exception:
-        print("Stable-Baselines3 not available. Install: pip install stable-baselines3 torch gymnasium")
+        print("Stable-Baselines3 not available. Install: pip install 'stable-baselines3[extra]' torch gymnasium")
         return
 
     if not args.model_path:
@@ -660,50 +674,35 @@ def eval_rl(args):
         import matplotlib.pyplot as plt
         plt.ion()
         fig, axs = plt.subplots(4, 1, figsize=(11, 9), sharex=True)
-        (l_u,)   = axs[0].plot([], [], lw=1.2, label="u")
-        axs[0].set_ylabel("u [V]"); axs[0].legend(); axs[0].grid(True)
+        for ax in axs: ax.grid(True)
+        (l_u,)   = axs[0].plot([], [], lw=1.2, label="u"); axs[0].set_ylabel("u [V]"); axs[0].legend()
         (l_i,)   = axs[1].plot([], [], lw=1.2, label="i")
-        (l_iref,) = axs[1].plot([], [], "--", lw=1.0, label="i_ref (n/a)")
-        axs[1].set_ylabel("i [A]"); axs[1].legend(); axs[1].grid(True)
+        (l_iref,) = axs[1].plot([], [], "--", lw=1.0, label="i_ref (n/a)"); axs[1].set_ylabel("i [A]"); axs[1].legend()
         (l_w,)   = axs[2].plot([], [], lw=1.2, label="ω")
-        (l_wref,) = axs[2].plot([], [], "--", lw=1.0, label="ω_ref")
-        axs[2].set_ylabel("ω [rad/s]"); axs[2].legend(); axs[2].grid(True)
+        (l_wref,) = axs[2].plot([], [], "--", lw=1.0, label="ω_ref"); axs[2].set_ylabel("ω [rad/s]"); axs[2].legend()
         (l_tem,) = axs[3].plot([], [], lw=1.2, label="T_em")
-        (l_tl,)  = axs[3].plot([], [], "--", lw=1.0, label="T_load")
-        axs[3].set_ylabel("Torque [Nm]"); axs[3].legend(); axs[3].grid(True)
+        (l_tl,)  = axs[3].plot([], [], "--", lw=1.0, label="T_load"); axs[3].set_ylabel("Torque [Nm]"); axs[3].legend()
         axs[3].set_xlabel("t [s]")
         fig.suptitle(f"TD3 Evaluation — task={args.task} | ref={args.ref_profile}")
-        wall_dt = (env.frame_skip * env.dt) / max(args.vis_speed, 1e-6)
+        wall_dt = (env.unwrapped.frame_skip * env.unwrapped.dt) / max(args.vis_speed, 1e-6)
 
     for _ in range(steps):
         action, _ = model.predict(obs, deterministic=True)
         obs, _, term, trunc, _ = env.step(action)
 
-        ts.append(env.t); us.append(env.prev_u); is_.append(env.state.i); ws.append(env.state.omega)
-        wrefs.append(speed_ref_profile(env.t, args.ref_profile, args.w_ref, env.rand_seq))
-        Tems.append(env.p.kT * env.state.i); Tls.append(env.base_load)
+        ue = env.unwrapped
+        ts.append(ue.t); us.append(ue.prev_u); is_.append(ue.state.i); ws.append(ue.state.omega)
+        wrefs.append(speed_ref_profile(ue.t, ue.ref_kind_speed, ue.w_ref_base, ue.rand_seq))
+        Tems.append(ue.p.kT * ue.state.i); Tls.append(ue.base_load)
 
         if args.live:
             import matplotlib.pyplot as plt
-            l_u.set_data(ts, us)
-            l_i.set_data(ts, is_)
-            l_iref.set_data(ts, [0.0]*len(ts))
-            l_w.set_data(ts, ws)
-            l_wref.set_data(ts, wrefs)
-            l_tem.set_data(ts, Tems)
-            l_tl.set_data(ts, Tls)
-            for ax in axs:
-                ax.relim(); ax.autoscale_view(True, True, True)
+            l_u.set_data(ts, us); l_i.set_data(ts, is_); l_iref.set_data(ts, [0.0]*len(ts))
+            l_w.set_data(ts, ws); l_wref.set_data(ts, wrefs); l_tem.set_data(ts, Tems); l_tl.set_data(ts, Tls)
+            for ax in axs: ax.relim(); ax.autoscale_view(True, True, True)
             plt.pause(0.001)
             if wall_dt > 0: time.sleep(wall_dt)
         if term or trunc: break
-
-    # ----- save requested CSVs -----
-    _save_series_csv(os.path.join(RUN_DIR, "eval_time_voltage.csv"), ts, us, headers=("t_s","u_V"))
-    _save_series_csv(os.path.join(RUN_DIR, "eval_time_current.csv"), ts, is_, headers=("t_s","i_A"))
-    _save_series_csv(os.path.join(RUN_DIR, "eval_time_speed_radps.csv"), ts, ws, headers=("t_s","omega_rad_s"))
-    _save_series_csv(os.path.join(RUN_DIR, "eval_time_torque.csv"), ts, Tems, headers=("t_s","T_em_Nm"))
-    print("[EVAL] Saved CSVs: eval_time_voltage/current/speed_radps/torque.csv")
 
     if args.live:
         import matplotlib.pyplot as plt
@@ -740,27 +739,45 @@ def main():
     parser.add_argument("--t_end", type=float, default=8.0)
     parser.add_argument("--dt", type=float, default=1e-4)
     parser.add_argument("--frame_skip", type=int, default=20)
-    parser.add_argument("--ep_len_s", type=float, default=8.0)
+    parser.add_argument("--ep_len_s", type=float, default=5.0)
     parser.add_argument("--total_timesteps", type=int, default=300_000)
     parser.add_argument("--live", action="store_true")
     parser.add_argument("--vis_speed", type=float, default=1.0, help="1.0=realtime, 0.5=2x slower")
     parser.add_argument("--w_ref", type=float, default=160.0)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tau_act", type=float, default=1e-3, help="Actuator time constant [s]")
+    parser.add_argument("--tau_act", type=float, default=3e-3, help="Actuator time constant [s]")
     # reward weights
     parser.add_argument("--rw_e", type=float, default=4.0)
     parser.add_argument("--rw_u", type=float, default=0.01)
     parser.add_argument("--rw_de", type=float, default=0.02)
     parser.add_argument("--rw_du", type=float, default=0.005)
     parser.add_argument("--rw_i", type=float, default=0.01)
-    # state safety clamps (no voltage cap)
+    # state safety clamps
     parser.add_argument("--i_abs_max", type=float, default=6.0)
     parser.add_argument("--omega_abs_max", type=float, default=900.0)
-    # ---- NEW: drift CLI ----
-    parser.add_argument("--drift_at", type=float, default=None, help="Time [s] to apply parameter drift (e.g., 1.5)")
-    parser.add_argument("--drift", type=str, default=None,
-                        help='Comma-separated: "R:+20%, L:*1.1, kT:-5%". Supported: R,L,kT,Ke,J,B,T_coulomb')
-
+    # warmup + HOLD controls
+    parser.add_argument("--warmup_zero_s", type=float, default=0.5)
+    parser.add_argument("--e_small", type=float, default=0.04)
+    parser.add_argument("--hold_w", type=float, default=0.003)
+    parser.add_argument("--hold_u_w", type=float, default=0.01)
+    parser.add_argument("--max_du", type=float, default=0.02)
+    parser.add_argument("--max_du_hold", type=float, default=0.005)
+    parser.add_argument("--r_band", type=float, default=0.02)
+    parser.add_argument("--r_band_latched", type=float, default=0.035)
+    parser.add_argument("--band_in", type=float, default=0.03, help="Latch when |e| < band_in")
+    parser.add_argument("--band_out", type=float, default=0.05, help="Unlatch when |e| > band_out")
+    # reward saturation
+    parser.add_argument("--reward_lo", type=float, default=-1.0, help="per-step reward lower clip")
+    parser.add_argument("--reward_hi", type=float, default=0.3,  help="per-step reward upper clip")
+    # low-speed helpers
+    parser.add_argument("--eint_tau", type=float, default=0.30,
+                        help="Leaky error integral time constant [s] (adds e_int to obs).")
+    parser.add_argument("--w_low_radps", type=float, default=120.0,
+                        help="Below this |ω_ref| treat as low-speed regime.")
+    parser.add_argument("--u_min_hold_low", type=float, default=0.05,
+                        help="Min |duty| encouraged when latched near low refs.")
+    parser.add_argument("--k_under_u_low", type=float, default=0.02,
+                        help="Penalty weight for shortfall below low-speed duty floor.")
     args = parser.parse_args()
 
     _choose_backend(headless=not args.live)
