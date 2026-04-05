@@ -325,7 +325,7 @@ def train(lock_rotor=True):
     callback = RewardLogger()
 
     model.learn(1_000_000, callback=callback)
-    model.save("pmsm_rl_current")
+    model.save("RL_models/pmsm_rl_current")
 
 
 # ==========================================================
@@ -334,7 +334,7 @@ def train(lock_rotor=True):
 
 def evaluate(lock_rotor=True):
     env = PMSMCurrentEnv(lock_rotor=lock_rotor)
-    model = TD3.load("pmsm_rl_current")
+    model = TD3.load("RL_models/pmsm_rl_current")
 
     obs, _ = env.reset()
 

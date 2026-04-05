@@ -387,7 +387,7 @@ def train():
     callback = RewardLoggerCallback()
 
     model.learn(1_000_000, callback=callback)
-    model.save("dc_rl_speed")
+    model.save("RL_models/dc_rl_speed")
 
 
 # ==========================================================
@@ -396,7 +396,7 @@ def train():
 
 def evaluate():
     env = DCMotorEnv()
-    model = TD3.load("dc_rl_speed")
+    model = TD3.load("RL_models/dc_rl_speed")
 
     obs, _ = env.reset()
 

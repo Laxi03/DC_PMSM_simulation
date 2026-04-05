@@ -375,7 +375,7 @@ def train():
     callback = RewardLoggerCallback()
 
     model.learn(1_000_000, callback=callback)
-    model.save("pmsm_rl_tracking")
+    model.save("RL_models/pmsm_rl_tracking")
 
 
 # ==========================================================
@@ -384,7 +384,7 @@ def train():
 
 def evaluate():
     env = PMSMEnv()
-    model = TD3.load("pmsm_rl_tracking")
+    model = TD3.load("RL_models/pmsm_rl_tracking")
 
     obs, _ = env.reset()
 

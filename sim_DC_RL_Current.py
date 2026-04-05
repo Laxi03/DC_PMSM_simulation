@@ -405,7 +405,7 @@ def train():
     callback = RewardLoggerCallback()
 
     model.learn(1_000_000, callback=callback)
-    model.save("dc_rl_current")
+    model.save("RL_models/dc_rl_current")
 
 
 # ==========================================================
@@ -422,7 +422,7 @@ def evaluate():
         load_torque=0.0,
         lock_rotor=True
     )
-    model = TD3.load("dc_rl_current")
+    model = TD3.load("RL_models/dc_rl_current.zip")
 
     obs, _ = env.reset()
 
