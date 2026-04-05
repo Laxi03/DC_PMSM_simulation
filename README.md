@@ -1,155 +1,416 @@
-# DC_PMSM_simulation
-Simulation of Controlled Electric Drives in a Python-Based Environment
+# Motor Control Benchmark Suite
 
-Python simulator of a **DC motor** (A-max 32, ~20 W) with optional **PI speed/current control** and **PWM**.
+![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
+![NumPy](https://img.shields.io/badge/NumPy-required-informational)
+![Matplotlib](https://img.shields.io/badge/Matplotlib-required-informational)
+![Gymnasium](https://img.shields.io/badge/Gymnasium-RL-green)
+![Stable--Baselines3](https://img.shields.io/badge/Stable--Baselines3-TD3-green)
+![Status](https://img.shields.io/badge/Status-research%20prototype-orange)
 
-The app runs a live animation and exports time-series data and a static summary figure to `exports/<timestamp>/`.
+A compact simulation project for benchmarking **classical motor control** against **reinforcement learning based control** on two drive types:
+
+- **DC motor**
+- **Permanent Magnet Synchronous Motor (PMSM)**
+
+The repository focuses on two canonical control problems:
+
+- **current tracking**
+- **speed tracking**
+
+It is especially suited for thesis, SRS (TDK), and educational work where the goal is to compare **PI / FOC baselines** with **TD3-based RL controllers** under consistent simulation conditions.
 
 ---
 
-## 🚀 Features
+## Highlights
 
-- Physics model: electrical + mechanical + coarse thermal states  
-- 4th-order Runge–Kutta (RK4) integration  
-- Optional **speed PI** or **current PI** control  
-- Optional **PWM** drive (`--pwm`) with average or switching behavior  
-- Built-in **step reference** profiles for speed and current  
-- Live matplotlib animation + automatic **CSV export** + static **PNG/PDF** plots  
-- All parameters adjustable from CLI flags  
+- Classical **PI control** for DC motor current and speed loops
+- Classical **FOC baseline** for PMSM current and speed control
+- **TD3 reinforcement learning** controllers for current and speed tracking
+- Standalone scripts with **minimal setup overhead**
+- Continuous-time motor models integrated with **RK4**
+- Practical nonidealities such as:
+  - actuator lag
+  - voltage saturation
+  - friction
+  - load torque
+  - randomized reference profiles
+- Built-in plotting and evaluation summaries
 
 ---
 
-## 🧩 Requirements
+## Repository Structure
 
-- **Python 3.10+**
-- Packages:
-  - `numpy`
-  - `matplotlib`
-
-Install dependencies:
-
-```bash
-python3 -m pip install numpy matplotlib
+```text
+sim_DC_PI.py              # Classical DC motor PI baseline
+sim_DC_RL_Current.py      # TD3-based RL for DC motor current control
+sim_DC_RL_Speed.py        # TD3-based RL for DC motor speed control
+sim_PMSM_FOC.py           # Classical PMSM FOC baseline
+sim_PMSM_RL_Current.py    # TD3-based RL for PMSM current control
+sim_PMSM_RL_Speed.py      # TD3-based RL for PMSM speed control
 ```
 
-> ℹ️ On macOS, ensure the Tk backend is available:  
-> `brew install python-tk`
+---
+
+## What Each Script Does
+
+### Classical baselines
+
+#### `sim_DC_PI.py`
+A DC motor simulator with classical PI control. Supports:
+
+- `--mode speed`
+- `--mode current`
+- fixed or random references
+- actuator lag
+- rotor lock option
+- voltage and integrator limits
+
+This script is the main **classical baseline** for the DC case.
+
+#### `sim_PMSM_FOC.py`
+A PMSM simulator with classical field oriented control. Supports:
+
+- `--mode speed`
+- `--mode current`
+- random references
+- rotor lock option
+- current limits
+- voltage saturation handling
+- base-speed style logic for field-weakening related operation
+
+This is the main **classical baseline** for the PMSM case.
+
+### RL controllers
+
+#### `sim_DC_RL_Current.py`
+TD3-based RL environment for **DC motor current tracking**.
+
+Key characteristics:
+- Gymnasium environment
+- continuous action space
+- randomized current references
+- actuator dynamics
+- reward shaping for tracking and control smoothness
+- saves model as `dc_rl_current`
+
+#### `sim_DC_RL_Speed.py`
+TD3-based RL environment for **DC motor speed tracking**.
+
+Key characteristics:
+- randomized speed profile generation
+- current and speed included in observation
+- continuous voltage command action
+- reward shaping with tracking and effort penalties
+- saves model as `dc_rl_speed`
+
+#### `sim_PMSM_RL_Current.py`
+TD3-based RL controller for **PMSM current tracking**.
+
+Key characteristics:
+- train / eval interface
+- optional `--free_rotor` mode
+- saves model as `pmsm_rl_current`
+
+#### `sim_PMSM_RL_Speed.py`
+TD3-based RL controller for **PMSM speed tracking**.
+
+Key characteristics:
+- train / eval interface
+- PMSM speed tracking benchmark
+- saves model as `pmsm_rl_tracking`
 
 ---
 
-## 🧭 Quick Start
+## Installation
 
-### ▶️ Speed PI + PWM (averaged) – step sequence, 3 s
+### 1. Create a virtual environment
 
 ```bash
-python3 sim_test.py --t_end 3   --pwm --avg_pwm --speed_ctrl --ref_profile step_seq   --kps 0.002 --kis 0.4 --ulim 1.0   --V 24 --Tload 0.0
+python -m venv .venv
+source .venv/bin/activate
 ```
 
-### ▶️ Current PI (no PWM) – constant reference, 2 s
+On Windows:
 
 ```bash
-python3 sim_test.py --t_end 2   --current_ctrl --i_ref 0.4 --kpc 1.0 --kic 50   --ulim 24 --V 24 --Tload 0.02
+.venv\Scripts\activate
 ```
 
-After each run, results appear in `exports/<timestamp>/`:
-- `live_full.png` and `live_full.pdf` — static full-run plots  
-- `live_*.csv` and `live_full_*.csv` — exported time series  
+### 2. Install dependencies
+
+```bash
+pip install numpy matplotlib gymnasium stable-baselines3
+```
+
+Depending on your Python environment, you may also want:
+
+```bash
+pip install torch
+```
 
 ---
 
-## ⚙️ CLI Arguments
+## Quick Start
 
-### Simulation parameters
-| Flag | Type | Default | Description |
-|------|------|----------|-------------|
-| `--t_end` | float | `2.0` | Simulation duration [s] |
-| `--dt` | float | `1e-4` | Integration step [s] |
-| `--V` | float | `24.0` | DC supply voltage [V] |
-| `--Tload` | float | `0.02` | Constant load torque [N·m] |
-| `--spf` | int | `200` | RK4 steps per animation frame |
-| `--window` | float | `1.0` | Live plot scroll window [s] |
-| `--smooth_ms` | float | `0.0` | Display-only smoothing (ms) |
-| `--smooth_cycles` | float | `0.0` | Display smoothing over PWM cycles |
-| `--downsample` | int | `8` | Downsample factor for plotting |
+### Classical DC baseline
 
----
+Run DC speed control:
 
-### PWM options
-| Flag | Type | Default | Description |
-|------|------|----------|-------------|
-| `--pwm` | flag | off | Enable PWM drive |
-| `--pwm_freq` | float | `5000.0` | PWM switching frequency [Hz] |
-| `--pwm_duty` | float | `0.4` | Fixed duty if not controlled |
-| `--avg_pwm` | flag | off | Use averaged PWM ( u = V·duty ) instead of switching |
+```bash
+python sim_DC_PI.py --mode speed
+```
 
----
+Run DC current control with random reference:
 
-### Speed PI control (ω in rad/s)
-| Flag | Type | Default | Description |
-|------|------|----------|-------------|
-| `--speed_ctrl` | flag | off | Enable speed PI controller |
-| `--w_ref` | float | `160.0` | Speed reference [rad/s] for `ref_profile=const` |
-| `--ref_profile` | choice | `const` | `const` or `step_seq` reference |
-| `--kps` | float | `0.002` | Proportional gain |
-| `--kis` | float | `0.4` | Integral gain |
-| `--ulim` | float | `24.0` | Output limit (Volts, or ±1.0 duty if `--pwm`) |
+```bash
+python sim_DC_PI.py --mode current --random_ref --lock_rotor
+```
 
----
+### Classical PMSM baseline
 
-### Current PI control (i in A)
-| Flag | Type | Default | Description |
-|------|------|----------|-------------|
-| `--current_ctrl` | flag | off | Enable current PI controller |
-| `--i_ref` | float | `0.4` | Current reference [A] for `i_ref_profile=const` |
-| `--i_ref_profile` | choice | `const` | `const` or `step_seq` |
-| `--kpc` | float | `1.0` | Proportional gain |
-| `--kic` | float | `50.0` | Integral gain |
+Run PMSM speed control:
 
-> **Controller behavior**  
-> - With `--pwm --avg_pwm`, the controller output is **duty ∈ [−1, 1]**, limited by `--ulim`.  
-> - Without PWM, the controller output is **voltage**, limited to ±`ulim` [V].
+```bash
+python sim_PMSM_FOC.py --mode speed
+```
 
----
+Run PMSM current control:
 
-## 📊 Outputs
+```bash
+python sim_PMSM_FOC.py --mode current --random_ref
+```
 
-**During simulation**
-- Live scrolling plots: **u [V]**, **i [A]**, **ω [rad/s]**, and **torques** ( T_em & T_load )
+### Train RL controllers
 
-**After completion (`exports/<timestamp>/`)**
-- `live_full.png` and `live_full.pdf` — static full-run figure  
-- CSVs:
-  - `live_u.csv`, `live_i.csv`, `live_omega.csv`
-  - `live_i_ref.csv`, `live_omega_ref.csv` (if relevant)
-  - `live_torque.csv` (T_em, T_load)
-  - downsampled `live_full_*.csv` versions  
+```bash
+python sim_DC_RL_Current.py --train
+python sim_DC_RL_Speed.py --train
+python sim_PMSM_RL_Current.py --train
+python sim_PMSM_RL_Speed.py --train
+```
+
+### Evaluate trained models
+
+```bash
+python sim_DC_RL_Current.py --eval
+python sim_DC_RL_Speed.py --eval
+python sim_PMSM_RL_Current.py --eval
+python sim_PMSM_RL_Speed.py --eval
+```
+
+PMSM current RL also supports:
+
+```bash
+python sim_PMSM_RL_Current.py --train --free_rotor
+python sim_PMSM_RL_Current.py --eval --free_rotor
+```
 
 ---
 
-## 🧠 Tuning Tips
+## Main Command-Line Options
 
-| Goal | Suggested change |
-|------|------------------|
-| Faster rise / tighter tracking | Increase `--kps` to `0.003`, `--kis` to `0.6` |
-| Better load disturbance rejection | Increase `--kis`; add `--Tload 0.02` |
-| Smoother PWM visualization | Add `--pwm --avg_pwm`, `--ulim 1.0` |
+### `sim_DC_PI.py`
+
+Important options include:
+
+- `--mode {speed,current}`
+- `--random_ref`
+- `--lock_rotor`
+- `--t_end`
+- `--dt`
+- `--Vdc`
+- `--Tload`
+- `--tau_act`
+- `--w_ref`, `--i_ref`
+- `--w_ref_min`, `--w_ref_max`
+- `--i_ref_min`, `--i_ref_max`
+- `--Kp_w`, `--Ki_w`
+- `--Kp_i`, `--Ki_i`
+
+### `sim_PMSM_FOC.py`
+
+Important options include:
+
+- `--mode {speed,current}`
+- `--random_ref`
+- `--dt`
+- `--t_end`
+- `--Vdc`
+- `--w_ref`
+- `--Tload`
+- `--Imax`
+- `--base_speed`
+- `--lock_rotor`
+- `--Kp_id`, `--Ki_id`
+- `--Kp_iq`, `--Ki_iq`
+- `--Kp_w`, `--Ki_w`
+
+### RL scripts
+
+The RL scripts primarily use:
+
+- `--train`
+- `--eval`
+
+And for PMSM current RL:
+
+- `--free_rotor`
 
 ---
 
-## ⚠️ Limitations
+## Typical Workflow
 
-- Thermal dynamics are coarse — illustrative only, not for thermal design.
-- The live animation requires the **TkAgg** or **MacOSX** backend.
+A typical comparison study looks like this:
+
+1. Run the **classical baseline** for a given task.
+2. Train the corresponding **RL controller**.
+3. Evaluate both on similar reference trajectories.
+4. Compare:
+   - tracking error
+   - overshoot behavior
+   - control effort
+   - smoothness of voltage commands
+   - final response quality
+   - reward trends in RL runs
+
+This structure makes the repository useful for side-by-side benchmarking rather than only standalone controller testing.
 
 ---
 
-## 📄 License
+## Output and Evaluation
 
-MIT License
+The scripts generate time-domain plots and console summaries. Depending on the selected file, outputs typically include:
+
+- reference trajectory
+- motor current
+- speed response
+- control voltage
+- torque response
+- reward history or reward diagnostics
+
+The RL evaluation scripts also print summary metrics such as:
+
+- mean absolute tracking error
+- maximum absolute tracking error
+- mean control magnitude
+- final speed
+- mean step reward
 
 ---
 
-## 🙏 Acknowledgements
+## Example Results Section
 
-A-max 32 nominal parameters are used as reference configuration.  
-All quantities are expressed in **SI units**.
+### DC current control
+- Classical PI controller provides a strong baseline with predictable behavior and easy tuning.
+
+![DC current tracking result](images/dc_current_tracking.png)
+
+*Figure 1. Current tracking performance of the PI controller on the DC motor.*
+- RL controller can reduce tracking error in some scenarios while learning smoother or more adaptive control actions depending on reward design.
+
+![DC current tracking result](images/dc_speed_RL.png)
+
+*Figure 2. Current tracking performance of the RL controller on the DC motor.*
+### DC speed control
+- The PI cascade gives an interpretable industrial baseline.
+
+![DC speed tracking result](images/dc_speed_tracking.png)
+
+*Figure 3. Speed tracking performance of the PI controller on the DC motor.*
+- The RL speed controller is useful for studying whether a learned policy can match or exceed the baseline under changing references and load conditions.
+
+![DC speed tracking result](images/dc_speed_RL.png)
+
+*Figure 4. Speed tracking performance of the RL controller on the DC motor.*
+### PMSM current control
+- FOC remains the standard reference approach for dq current regulation.
+![PMSM current tracking result](images/pmsm_current_tracking.png)
+
+*Figure 5. Current tracking performance of the PI controller on the PMSM motor.*
+- RL offers an alternative policy-learning framework, especially interesting when nonidealities or changing operating modes are introduced.
+
+![PMSM current tracking result](images/pmsm_current_RL.png)
+
+*Figure 6. Current tracking performance of the RL controller on the PMSM motor.*
+### PMSM speed control
+- Classical speed-loop plus current-loop structure remains the benchmark.
+
+![PMSM speed tracking result](images/pmsm_speed_tracking.png)
+
+*Figure 7. Speed tracking performance of the PI controller on the PMSM motor.*
+- RL can be evaluated for robustness, smoothness, and multi-objective tradeoffs encoded through reward shaping.
+
+![PMSM speed tracking result](images/pmsm_speed_RL.png)
+
+*Figure 8. Speed tracking performance of the RL controller on the PMSM motor.*
+
+---
+
+## Saved Models
+
+Training produces local model files with the following names:
+
+- `dc_rl_current`
+- `dc_rl_speed`
+- `pmsm_rl_current`
+- `pmsm_rl_tracking`
+
+Run evaluation only after the corresponding model has been trained and saved.
+
+---
+
+## Technical Notes
+
+- The project is organized as **standalone scripts**, not as a packaged library.
+- Parameters are embedded directly in the files for fast experimentation.
+- Numerical integration is based on **RK4**.
+- RL controllers use **TD3** through Stable-Baselines3.
+- The focus is on **simulation benchmarking**, not direct deployment.
+
+---
+
+## Use Cases
+
+This repository is suitable for:
+
+- thesis and TDK work
+- motor-control education
+- benchmarking RL against classical control
+- studying reward shaping in control tasks
+- generating figures for reports and presentations
+- rapid testing before more advanced hardware-oriented work
+
+---
+
+## Limitations
+
+- No unified package structure yet
+- No central configuration file
+- No automated benchmark runner
+- No CSV export pipeline by default
+- Comparisons are meaningful, but not a formal standardized benchmark suite yet
+
+---
+
+## Future Improvements
+
+Possible next steps:
+
+- add a unified config system
+- save metrics automatically to CSV
+- create reproducible benchmark scenarios
+- add noise and parameter uncertainty sweeps
+- export publication-ready plots automatically
+- extend to hardware-in-the-loop or embedded deployment studies
+
+---
+
+## License
+
+This project is licensed under the **MIT License**.
+
+---
+
+## Author Notes
+
+This project is best understood as a **research and educational benchmark suite** for comparing **classical control** and **reinforcement learning** in electric drive simulations.
