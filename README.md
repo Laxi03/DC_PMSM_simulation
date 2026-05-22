@@ -34,7 +34,12 @@ It is especially suited for thesis, SRS (TDK), and educational work where the go
   - friction
   - load torque
   - randomized reference profiles
+  - runtime parameter perturbations
 - Built-in plotting and evaluation summaries
+- Reproducible scenarios with **seeded evaluation**
+- PMSM support for:
+  - **runtime perturbation of** `R`, `L_d`, `L_q`, `lambda`, `Vdc`
+  - **locked rotor**, **free motor**, and **sinusoidal imposed-speed current-control** modes
 
 ---
 
@@ -72,11 +77,29 @@ A PMSM simulator with classical field oriented control. Supports:
 
 - `--mode speed`
 - `--mode current`
-- random references
-- rotor lock option
+- random or fixed references
+- seeded reproducible runs
+- runtime perturbations in:
+  - `R`
+  - `L_d`
+  - `L_q`
+  - `lam`
+  - `Vdc`
+- current-control mechanical modes:
+  - `locked`
+  - `free`
+  - `sinus_speed`
 - current limits
 - voltage saturation handling
 - base-speed style logic for field-weakening related operation
+- saliency-aware PMSM model using separate `L_d` and `L_q`
+
+Important implementation detail:
+
+- when a runtime perturbation happens, the **plant parameters change**
+- the **controller PI gains stay fixed**
+- but model-based controller terms that depend on active parameters use the **current perturbed values**
+- the PI gains are **not recalculated online**
 
 This is the main **classical baseline** for the PMSM case.
 
@@ -108,7 +131,17 @@ TD3-based RL controller for **PMSM current tracking**.
 
 Key characteristics:
 - train / eval interface
-- optional `--free_rotor` mode
+- current-control modes:
+  - `locked`
+  - `free`
+  - `sinus_speed`
+- runtime perturbation support for:
+  - `R`
+  - `L_d`
+  - `L_q`
+  - `lam`
+  - `Vdc`
+- seeded reproducible evaluation
 - saves model as `pmsm_rl_current`
 
 #### `sim_PMSM_RL_Speed.py`
@@ -116,7 +149,15 @@ TD3-based RL controller for **PMSM speed tracking**.
 
 Key characteristics:
 - train / eval interface
-- PMSM speed tracking benchmark
+- saliency-aware PMSM model with `L_d` and `L_q`
+- runtime perturbation support for:
+  - `R`
+  - `L_d`
+  - `L_q`
+  - `lam`
+  - `Vdc`
+- seeded reproducible evaluation
+- internal PI-generated current references are available to the RL policy
 - saves model as `pmsm_rl_tracking`
 
 ---
@@ -174,10 +215,16 @@ Run PMSM speed control:
 python sim_PMSM_FOC.py --mode speed
 ```
 
-Run PMSM current control:
+Run PMSM current control, locked rotor:
 
 ```bash
-python sim_PMSM_FOC.py --mode current --random_ref
+python sim_PMSM_FOC.py --mode current --current_control_mode locked --random_ref
+```
+
+Run PMSM current control with imposed sinusoidal speed profile:
+
+```bash
+python sim_PMSM_FOC.py --mode current --current_control_mode sinus_speed --random_ref --sinus_w_amp 300
 ```
 
 ### Train RL controllers
@@ -201,8 +248,11 @@ python sim_PMSM_RL_Speed.py --eval
 PMSM current RL also supports:
 
 ```bash
-python sim_PMSM_RL_Current.py --train --free_rotor
-python sim_PMSM_RL_Current.py --eval --free_rotor
+python sim_PMSM_RL_Current.py --train --control_mode free
+python sim_PMSM_RL_Current.py --eval --control_mode free
+
+python sim_PMSM_RL_Current.py --train --control_mode sinus_speed --sinus_w_amp 300
+python sim_PMSM_RL_Current.py --eval --control_mode sinus_speed --sinus_w_amp 300
 ```
 
 ---
@@ -233,17 +283,27 @@ Important options include:
 
 - `--mode {speed,current}`
 - `--random_ref`
+- `--seed`
 - `--dt`
 - `--t_end`
 - `--Vdc`
+- `--Ld_pp`
+- `--Lq_pp`
 - `--w_ref`
+- `--iq_ref`
 - `--Tload`
 - `--Imax`
 - `--base_speed`
-- `--lock_rotor`
+- `--current_control_mode {locked,free,sinus_speed}`
+- `--sinus_w_amp`
 - `--Kp_id`, `--Ki_id`
 - `--Kp_iq`, `--Ki_iq`
 - `--Kp_w`, `--Ki_w`
+- `--perturb`
+- `--perturb_target {R,Ld,Lq,lam,Vdc}`
+- `--perturb_change`
+- `--perturb_time`
+- `--perturb_random_time`
 
 ### RL scripts
 
@@ -252,9 +312,20 @@ The RL scripts primarily use:
 - `--train`
 - `--eval`
 
-And for PMSM current RL:
+Additional important PMSM RL options:
 
-- `--free_rotor`
+#### `sim_PMSM_RL_Current.py`
+- `--control_mode {locked,free,sinus_speed}`
+- `--sinus_w_amp`
+- `--seed`
+- `--perturb`
+- `--perturb_target {R,Ld,Lq,lam,Vdc}`
+
+#### `sim_PMSM_RL_Speed.py`
+- `--seed`
+- `--Tload`
+- `--perturb`
+- `--perturb_target {R,Ld,Lq,lam,Vdc}`
 
 ---
 
@@ -272,6 +343,7 @@ A typical comparison study looks like this:
    - smoothness of voltage commands
    - final response quality
    - reward trends in RL runs
+   - robustness under runtime parameter changes
 
 This structure makes the repository useful for side-by-side benchmarking rather than only standalone controller testing.
 
@@ -286,6 +358,7 @@ The scripts generate time-domain plots and console summaries. Depending on the s
 - speed response
 - control voltage
 - torque response
+- runtime parameter traces
 - reward history or reward diagnostics
 
 The RL evaluation scripts also print summary metrics such as:
@@ -295,6 +368,12 @@ The RL evaluation scripts also print summary metrics such as:
 - mean control magnitude
 - final speed
 - mean step reward
+
+The PMSM classical and RL scripts also support **fair seeded comparisons**, where the same seed reproduces:
+
+- the same reference profile
+- the same evaluation timing domain
+- the same random perturbation time, if enabled
 
 ---
 
@@ -306,38 +385,51 @@ The RL evaluation scripts also print summary metrics such as:
 ![DC current tracking result](images/dc_current_tracking.png)
 
 *Figure 1. Current tracking performance of the PI controller on the DC motor.*
+
 - RL controller can reduce tracking error in some scenarios while learning smoother or more adaptive control actions depending on reward design.
 
 ![DC current tracking result](images/dc_speed_RL.png)
 
 *Figure 2. Current tracking performance of the RL controller on the DC motor.*
+
 ### DC speed control
 - The PI cascade gives an interpretable industrial baseline.
 
 ![DC speed tracking result](images/dc_speed_tracking.png)
 
 *Figure 3. Speed tracking performance of the PI controller on the DC motor.*
+
 - The RL speed controller is useful for studying whether a learned policy can match or exceed the baseline under changing references and load conditions.
 
 ![DC speed tracking result](images/dc_speed_RL.png)
 
 *Figure 4. Speed tracking performance of the RL controller on the DC motor.*
+
 ### PMSM current control
 - FOC remains the standard reference approach for dq current regulation.
+- The extended current benchmark can now be studied in three mechanical settings:
+  - locked rotor
+  - free motor
+  - imposed sinusoidal speed profile
+
 ![PMSM current tracking result](images/pmsm_current_tracking.png)
 
 *Figure 5. Current tracking performance of the PI controller on the PMSM motor.*
-- RL offers an alternative policy-learning framework, especially interesting when nonidealities or changing operating modes are introduced.
+
+- RL offers an alternative policy-learning framework, especially interesting when nonidealities, parameter changes, or changing mechanical modes are introduced.
 
 ![PMSM current tracking result](images/pmsm_current_RL.png)
 
 *Figure 6. Current tracking performance of the RL controller on the PMSM motor.*
+
 ### PMSM speed control
 - Classical speed-loop plus current-loop structure remains the benchmark.
+- The saliency-aware model with `L_d` and `L_q` enables more detailed perturbation studies.
 
 ![PMSM speed tracking result](images/pmsm_speed_tracking.png)
 
 *Figure 7. Speed tracking performance of the PI controller on the PMSM motor.*
+
 - RL can be evaluated for robustness, smoothness, and multi-objective tradeoffs encoded through reward shaping.
 
 ![PMSM speed tracking result](images/pmsm_speed_RL.png)
@@ -366,6 +458,15 @@ Run evaluation only after the corresponding model has been trained and saved.
 - Numerical integration is based on **RK4**.
 - RL controllers use **TD3** through Stable-Baselines3.
 - The focus is on **simulation benchmarking**, not direct deployment.
+- PMSM perturbation studies distinguish between:
+  - **fixed controller gains**
+  - **changed runtime plant parameters**
+
+In the updated classical PMSM FOC benchmark:
+- PI gains are kept fixed during the run
+- runtime perturbations modify the active plant
+- model-dependent controller terms use the currently active perturbed parameters
+- gains themselves are not re-tuned online
 
 ---
 
@@ -377,6 +478,7 @@ This repository is suitable for:
 - motor-control education
 - benchmarking RL against classical control
 - studying reward shaping in control tasks
+- studying robustness against runtime parameter changes
 - generating figures for reports and presentations
 - rapid testing before more advanced hardware-oriented work
 
