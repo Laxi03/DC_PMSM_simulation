@@ -1,0 +1,28 @@
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+*.egg-info/
+/build/
+/dist/
+
+# Local checkpoints and simulation outputs
+/models/
+/RL_models/
+/outputs/
+/archive/
+*.zip
+*.pt
+*.pth
+
+# Editor, operating-system and local secrets
+.idea/
+.vscode/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key

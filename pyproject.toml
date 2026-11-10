@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "td3-drive-control"
+version = "0.1.0"
+description = "DC and PMSM motor-control simulations with PI, FOC and TD3"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "László Ákos Kun"}]
+dependencies = ["numpy>=1.26,<3", "matplotlib>=3.8,<4"]
+
+[project.optional-dependencies]
+rl = ["stable-baselines3==2.9.2", "gymnasium==1.2.2", "torch==2.13.0"]
+
+[project.scripts]
+td3-control = "td3_drive_control.cli:main"
+
+[project.urls]
+Repository = "https://github.com/Laxi03/DC_PMSM_simulation"
+Issues = "https://github.com/Laxi03/DC_PMSM_simulation/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = false
